@@ -100,35 +100,24 @@ def safe_parse_dates(df: pd.DataFrame, cols, dayfirst: bool = True, report: bool
 
 
 class Data:
-    MOCA_DATA_COLS = [
-        'MoCA_Executive',
-        'MoCA_Benennen',
-        'MoCA_Aufmerksamkeit_Zahlenliste',
-        'MoCA_Aufmerksamkeit_Buchstabenliste',
-        'MoCA_Aufmerksamkeit_Abziehen',
-        'MoCA_Sprache_Wiederholen',
-        'MoCA_Sprache_Buchstaben',
-        'MoCA_Abstraktion',
-        'MoCA_Erinnerung',
-        'MoCA_Orientierung'
-    ]
-
-    MOCA_CATEGORIES = {
-        "Aufmerksamkeit": [
+    MOCA_CATEGORY_MAP = {
+        "MoCA_Executive": ["MoCA_Executive"],
+        "MoCA_Benennen": ["MoCA_Benennen"],
+        "MoCA_Aufmerksamkeit": [
             "MoCA_Aufmerksamkeit_Zahlenliste",
             "MoCA_Aufmerksamkeit_Buchstabenliste",
             "MoCA_Aufmerksamkeit_Abziehen"
         ],
-        "Sprache": [
+        "MoCA_Sprache": [
             "MoCA_Sprache_Wiederholen",
             "MoCA_Sprache_Buchstaben"
         ],
-        "Benennen": ["MoCA_Benennen"],
-        "Executive": ["MoCA_Executive"],
-        "Abstraktion": ["MoCA_Abstraktion"],
-        "Erinnerung": ["MoCA_Erinnerung"],
-        "Orientierung": ["MoCA_Orientierung"]
+        "MoCA_Abstraktion": ["MoCA_Abstraktion"],
+        "MoCA_Erinnerung": ["MoCA_Erinnerung"],
+        "MoCA_Orientierung": ["MoCA_Orientierung"]
     }
+
+    MOCA_DATA_COLS = list(MOCA_CATEGORY_MAP.keys())
 
     def __init__(self, path_of_folder: str, foldertype: str = "PPMI", covariate_names: Optional[str] = None):
         """
@@ -294,15 +283,117 @@ class Data:
     # ---------- Helpers operating on provided dicts ----------
     def _augment_moca_scores(self, moca_df: pd.DataFrame) -> pd.DataFrame:
         df = moca_df.copy()
+        drop_columns: Set[str] = set()
+
+        for agg_col, item_cols in self.MOCA_CATEGORY_MAP.items():
+            present = [col for col in item_cols if col in df.columns]
+            if not present:
+                continue
+
+            agg_series = df[present].sum(axis=1, skipna=False)
+            df[agg_col] = agg_series
+            df[f"{agg_col}_sum"] = agg_series
+
+            for col in present:
+                if col not in {agg_col, f"{agg_col}_sum"}:
+                    drop_columns.add(col)
+
+        if drop_columns:
+            df = df.drop(columns=list(drop_columns), errors="ignore")
+
+        base_cols = [col for col in self.MOCA_DATA_COLS if col in df.columns]
+        if base_cols:
+            df["MoCA_sum"] = df[base_cols].sum(axis=1, skipna=False)
+
+        sum_cols = [f"{col}_sum" for col in self.MOCA_DATA_COLS if f"{col}_sum" in df.columns]
+        if sum_cols:
+            df["MoCA_sum_post"] = df[sum_cols].sum(axis=1, skipna=False)
+
         if "MoCA_ONLY_GES" in df.columns:
-            df["MoCA_sum"] = df.apply(
-                lambda row: row[self.MOCA_DATA_COLS].sum(skipna=False) if pd.isna(row["MoCA_ONLY_GES"]) else row["MoCA_ONLY_GES"],
-                axis=1
-            )
-        for cat_name, item_cols in self.MOCA_CATEGORIES.items():
-            if set(item_cols).issubset(df.columns):
-                df[f"MoCA_{cat_name}_sum"] = df[item_cols].sum(axis=1, skipna=False)
+            existing_sum = df.get("MoCA_sum")
+            if existing_sum is not None:
+                df["MoCA_sum"] = df["MoCA_ONLY_GES"].combine_first(existing_sum)
+            else:
+                df["MoCA_sum"] = df["MoCA_ONLY_GES"]
+            df.drop(columns=["MoCA_ONLY_GES"], inplace=True, errors="ignore")
+
         return df
+
+    def _aggregate_custom_moca_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        result = df.copy()
+        drop_columns: Set[str] = set()
+
+        suffix_groups = {
+            "pre": ["", "_pre"],
+            "post": ["_post", "_sum"]
+        }
+
+        for agg_col, item_cols in self.MOCA_CATEGORY_MAP.items():
+            for phase, suffixes in suffix_groups.items():
+                target_col = agg_col if phase == "pre" else f"{agg_col}_sum"
+                candidates: List[str] = []
+                for item in item_cols:
+                    for suffix in suffixes:
+                        candidate = f"{item}{suffix}" if suffix else item
+                        if candidate in result.columns:
+                            candidates.append(candidate)
+                if not candidates:
+                    continue
+
+                agg_series = result[candidates].sum(axis=1, skipna=False)
+                result[target_col] = agg_series
+                for candidate in candidates:
+                    if candidate not in {target_col}:
+                        drop_columns.add(candidate)
+
+        if drop_columns:
+            result = result.drop(columns=list(drop_columns), errors="ignore")
+
+        base_cols = [col for col in self.MOCA_DATA_COLS if col in result.columns]
+        if base_cols:
+            result["MoCA_sum"] = result[base_cols].sum(axis=1, skipna=False)
+
+        sum_cols = [f"{col}_sum" for col in self.MOCA_DATA_COLS if f"{col}_sum" in result.columns]
+        if sum_cols:
+            result["MoCA_sum_post"] = result[sum_cols].sum(axis=1, skipna=False)
+
+        if "MoCA_ONLY_GES" in result.columns:
+            existing_sum = result.get("MoCA_sum")
+            if existing_sum is not None:
+                result["MoCA_sum"] = result["MoCA_ONLY_GES"].combine_first(existing_sum)
+            else:
+                result["MoCA_sum"] = result["MoCA_ONLY_GES"]
+            result.drop(columns=["MoCA_ONLY_GES"], inplace=True, errors="ignore")
+
+        for post_total_col in ("MoCA_ONLY_GES_post", "MoCA_ONLY_GES_sum"):
+            if post_total_col in result.columns:
+                result["MoCA_sum_post"] = result[post_total_col]
+                drop_columns.add(post_total_col)
+
+        if drop_columns:
+            result = result.drop(columns=list(drop_columns), errors="ignore")
+
+        return result
+
+    @staticmethod
+    def _rename_moca_pre_post(df: pd.DataFrame) -> pd.DataFrame:
+        renamed = df.copy()
+        rename_map: Dict[str, str] = {}
+        for col in renamed.columns:
+            if not col.startswith("MoCA_"):
+                continue
+            if col.endswith("_pre") or col.endswith("_post"):
+                continue
+            if col.endswith("_sum"):
+                base = col[:-4]
+                rename_map[col] = f"{base}_post"
+            else:
+                rename_map[col] = f"{col}_pre"
+
+        if rename_map:
+            renamed = renamed.rename(columns=rename_map)
+
+        return renamed
 
     def _prepare_moca_with_demo(self, complete_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         moca_df = complete_data.get("moca")
@@ -376,10 +467,10 @@ class Data:
         pc_df = moca_with_demo[available_cols].copy()
 
         # add category sums if present
-        for cat_name in self.MOCA_CATEGORIES:
-            col_name = f"MoCA_{cat_name}_sum"
-            if col_name in moca_with_demo.columns:
-                pc_df[col_name] = moca_with_demo[col_name]
+        for agg_col in self.MOCA_CATEGORY_MAP:
+            for variant in (agg_col, f"{agg_col}_sum"):
+                if variant in moca_with_demo.columns:
+                    pc_df[variant] = moca_with_demo[variant]
 
         subset_cols = [c for c in ["PATNO", "OP_DATUM", "TEST_DATUM", "LOCATION"] if c in pc_df.columns]
         pc_df_before_merge = pc_df[subset_cols].copy()
@@ -460,6 +551,7 @@ class Data:
         # Load custom cohort
         custom_df = pd.read_csv(csv_path)
         custom_df = custom_df.rename(columns={c: c.replace('_pre', '') for c in custom_df.columns if c.endswith('_pre')})
+        custom_df = self._aggregate_custom_moca_columns(custom_df)
 
         if "TEST_DATUM" not in custom_df.columns and "OP_DATUM" in custom_df.columns and "TimeSinceSurgery" in custom_df.columns:
             custom_df["OP_DATUM"] = pd.to_datetime(custom_df["OP_DATUM"])
@@ -471,10 +563,37 @@ class Data:
 
         custom_df.rename(columns={"Pat_ID": "PATNO"}, inplace=True)
 
+        date_cols = [col for col in ("TEST_DATUM", "TEST_DATUM_post", "TEST_DATUM_sum", "OP_DATUM") if col in custom_df.columns]
+        if date_cols:
+            custom_df = safe_parse_dates(custom_df, cols=date_cols, dayfirst=True, report=False)
+
+        pre_date_col = next((c for c in ("TEST_DATUM", "TEST_DATUM_pre") if c in custom_df.columns), None)
+        post_date_col = next((c for c in ("TEST_DATUM_post", "TEST_DATUM_sum") if c in custom_df.columns), None)
+
+        if pre_date_col is not None:
+            if "OP_DATUM" in custom_df.columns:
+                custom_df["OP_DATUM"] = custom_df["OP_DATUM"].where(custom_df["OP_DATUM"].notna(), custom_df[pre_date_col])
+            else:
+                custom_df["OP_DATUM"] = custom_df[pre_date_col]
+
+        if pre_date_col is not None and post_date_col is not None:
+            diff_days = (custom_df[post_date_col] - custom_df[pre_date_col]).dt.days
+            diff_years = diff_days / 365.25
+            if "TimeSinceSurgeryDays" in custom_df.columns:
+                custom_df["TimeSinceSurgeryDays"] = pd.to_numeric(custom_df["TimeSinceSurgeryDays"], errors="coerce").fillna(diff_days)
+            else:
+                custom_df["TimeSinceSurgeryDays"] = diff_days
+            existing_ts = custom_df.get("TimeSinceSurgery")
+            if existing_ts is not None:
+                existing_ts = pd.to_numeric(existing_ts, errors="coerce")
+                custom_df["TimeSinceSurgery"] = existing_ts.fillna(diff_years)
+            else:
+                custom_df["TimeSinceSurgery"] = diff_years
+
         if id_column is None:
             raise ValueError("Provide id_column for the custom cohort.")
 
-        custom_df = safe_parse_dates(custom_df, cols=["TEST_DATUM"], dayfirst=True, report=False)
+        custom_df = safe_parse_dates(custom_df, cols=["TEST_DATUM", "OP_DATUM"], dayfirst=True, report=False)
         custom_df = custom_df.dropna(subset=[id_column, "TEST_DATUM"]).copy()
         custom_df[id_column] = custom_df[id_column].astype(str)
         custom_df.sort_values([id_column, "TEST_DATUM"], inplace=True)
@@ -515,6 +634,22 @@ class Data:
         if "DIAG_DATE" in ppmi_df.columns:
             ppmi_df["TimeSinceDiagYears"] = ((ppmi_df["TEST_DATUM"] - ppmi_df["DIAG_DATE"]).dt.days / 365.25)
 
+        if "OP_DATUM" in ppmi_df.columns:
+            ppmi_df["OP_DATUM"] = ppmi_df["OP_DATUM"].where(ppmi_df["OP_DATUM"].notna(), ppmi_first)
+        else:
+            ppmi_df["OP_DATUM"] = ppmi_first
+
+        baseline_days = ppmi_df["TimeSinceBaselineDays"]
+        baseline_years = ppmi_df["TimeSinceBaselineYears"]
+        if "TimeSinceSurgeryDays" in ppmi_df.columns:
+            ppmi_df["TimeSinceSurgeryDays"] = pd.to_numeric(ppmi_df["TimeSinceSurgeryDays"], errors="coerce").fillna(baseline_days)
+        else:
+            ppmi_df["TimeSinceSurgeryDays"] = baseline_days
+        if "TimeSinceSurgery" in ppmi_df.columns:
+            ppmi_df["TimeSinceSurgery"] = pd.to_numeric(ppmi_df["TimeSinceSurgery"], errors="coerce").fillna(baseline_years)
+        else:
+            ppmi_df["TimeSinceSurgery"] = baseline_years
+
         if use_updrs and "mds_updrs" in ppmi_cd:
             updrs_df = ppmi_cd["mds_updrs"].get("mds_updrs3")
             if updrs_df is not None and not updrs_df.empty:
@@ -552,7 +687,11 @@ class Data:
         if not shared_features:
             raise ValueError("No overlapping numeric covariates found between cohorts.")
 
-        feature_cols = list(dict.fromkeys(shared_features + ["TimeSinceBaselineYears"]))
+        extra_features = ["TimeSinceBaselineYears"]
+        if "TimeSinceSurgery" in custom_work.columns and "TimeSinceSurgery" in ppmi_work.columns:
+            extra_features.append("TimeSinceSurgery")
+
+        feature_cols = list(dict.fromkeys(shared_features + extra_features))
 
         custom_model_df = custom_work.dropna(subset=feature_cols + ["TimeSinceBaselineDays"])
         ppmi_model_df = ppmi_work.dropna(subset=feature_cols + ["TimeSinceBaselineDays"])
@@ -639,6 +778,9 @@ class Data:
         matched_ppmi["matched_custom_index"] = matched_custom_idx
         matched_ppmi["propensity_diff"]      = diagnostics["propensity_diff"].values
         matched_ppmi["time_diff_days"]       = diagnostics["time_diff_days"].values
+
+        matched_custom = self._rename_moca_pre_post(matched_custom)
+        matched_ppmi   = self._rename_moca_pre_post(matched_ppmi)
 
         return {
             "custom": matched_custom.reset_index(drop=True),
