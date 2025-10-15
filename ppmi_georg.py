@@ -556,11 +556,16 @@ class Data:
 
     def _get_updrs3_by_state(self, updrs3: pd.DataFrame, state: str = "off") -> pd.DataFrame:
         """
-        Extract general MDS-UPDRS Part III totals for a given medication state using PDSTATE when available.
-        - ON is treated broadly: numeric PDSTATE > 0, or strings containing 'ON' (case-insensitive).
-        - OFF: numeric PDSTATE == 0, or strings containing 'OFF'.
-        Fallback to OFFEXAM/ONEXAM if PDSTATE is unavailable or blank.
-        Returns: PATNO, TEST_DATUM, UPDRS_off or UPDRS_on (depending on 'state').
+        Extract MDS-UPDRS Part III totals for a given medication state using PDSTATE when available.
+        - ON is: numeric PDSTATE > 0, or strings containing 'ON' (case-insensitive).
+        - OFF is: numeric PDSTATE == 0, or strings containing 'OFF'.
+        - Fallback to OFFEXAM/ONEXAM if PDSTATE is unavailable or blank.
+
+        Returns a dataframe with columns:
+          - PATNO
+          - TEST_DATUM (parsed datetime)
+          - UPDRS_off or UPDRS_on (depending on 'state')
+          - EVENT_ID (included if present in the source)
         """
         if updrs3 is None or updrs3.empty:
             return pd.DataFrame(columns=["PATNO", "TEST_DATUM", f"UPDRS_{state}"])
@@ -571,9 +576,9 @@ class Data:
 
         df = updrs3.copy()
 
-        # total column candidates
+        # Identify total score column
         total_candidates = [
-            "MDS-UPDRS_3_ONLY_Gesamt",  # your mapped name
+            "MDS-UPDRS_3_ONLY_Gesamt",  # mapped name after your renames
             "NP3TOT",
             "UPDRS_III_TOTAL",
             "MDS_UPDRS_III_TOTAL",
@@ -582,74 +587,67 @@ class Data:
         if total_col is None:
             return pd.DataFrame(columns=["PATNO", "TEST_DATUM", f"UPDRS_{state}"])
 
-        # date column candidates
-        date_candidates = ["INFODT", "TEST_DATUM", "EXAMDT"]
-        date_col = next((c for c in date_candidates if c in df.columns), None)
-        if date_col is None:
-            return pd.DataFrame(columns=["PATNO", "TEST_DATUM", f"UPDRS_{state}"])
-
-        total_candidates = [
-            "MDS-UPDRS_3_ONLY_Gesamt", "NP3TOT", "UPDRS_III_TOTAL", "MDS_UPDRS_III_TOTAL",
-        ]
-        total_col = next((c for c in total_candidates if c in df.columns), None)
-        if total_col is None:
-            return pd.DataFrame(columns=["PATNO", "TEST_DATUM", f"UPDRS_{state}"])
-        
+        # Identify exam date column
         date_candidates = ["TEST_DATUM", "INFODT", "EXAMDT"]
         date_col = next((c for c in date_candidates if c in df.columns), None)
         if date_col is None:
             return pd.DataFrame(columns=["PATNO", "TEST_DATUM", f"UPDRS_{state}"])
-        
-        cols = ["PATNO", date_col, total_col]
+
+        # ---- Build state mask using PDSTATE, else OFFEXAM/ONEXAM ----
+        mask = pd.Series(True, index=df.index)
+
+        if "PDSTATE" in df.columns:
+            ps = df["PDSTATE"]
+            ps_num = pd.to_numeric(ps, errors="coerce")
+
+            # If any numeric codes exist, use them; else fall back to strings
+            if ps_num.notna().any():
+                if state == "off":
+                    mask = ps_num == 0
+                else:
+                    mask = ps_num > 0
+            else:
+                ps_norm = ps.astype(str).str.upper()
+                if state == "off":
+                    mask = ps_norm.str.contains(r"\bOFF\b", na=False)
+                else:
+                    mask = ps_norm.str_contains = ps_norm.str.contains(r"\bON\b", na=False)
+
+        # If PDSTATE didn’t produce a mask (all NA / empty), use OFFEXAM/ONEXAM flags as fallback
+        if (mask is None) or (mask.sum() == 0):
+            mask = pd.Series(False, index=df.index)
+            if state == "off":
+                if "OFFEXAM" in df.columns:
+                    mask = mask | (df["OFFEXAM"] == 1)
+                if "ONEXAM" in df.columns:
+                    mask = mask | (df["ONEXAM"] == 0)
+            else:
+                if "ONEXAM" in df.columns:
+                    mask = mask | (df["ONEXAM"] == 1)
+                if "OFFEXAM" in df.columns:
+                    mask = mask | (df["OFFEXAM"] == 0)
+
+        # Subset and rename
+        cols = ["PATNO"]
         if "EVENT_ID" in df.columns:
-            cols.insert(1, "EVENT_ID")  # keep EVENT_ID if present
-        
-        out = df[cols].rename(
+            cols.append("EVENT_ID")
+        cols.extend([date_col, total_col])
+
+        out = df.loc[mask, cols].rename(
             columns={date_col: "TEST_DATUM", total_col: f"UPDRS_{state}"}
         )
 
-        idx = pd.Index([])
-        if "PDSTATE" in df.columns:
-            ps = df["PDSTATE"]
-
-            # First try numeric coding (accept any >0 as ON)
-            ps_num = pd.to_numeric(ps, errors="coerce")
-            if ps_num.notna().any():
-                if state == "off":
-                    idx = df.index[ps_num == 0]
-                else:
-                    idx = df.index[ps_num > 0]
-            else:
-                # Fall back to string patterns
-                ps_norm = ps.astype(str).str.upper()
-                if state == "off":
-                    idx = df.index[ps_norm.str.contains(r"\bOFF\b")]
-                else:
-                    idx = df.index[ps_norm.str.contains(r"\bON\b")]
-
-        # Fallback: OFFEXAM / ONEXAM
-        if len(idx) == 0:
-            mask = None
-            if state == "off":
-                if "OFFEXAM" in df.columns:
-                    mask = (df["OFFEXAM"] == 1)
-                if "ONEXAM" in df.columns:
-                    m2 = (df["ONEXAM"] == 0)
-                    mask = m2 if mask is None else (mask | m2)
-            else:
-                if "ONEXAM" in df.columns:
-                    mask = (df["ONEXAM"] == 1)
-                if "OFFEXAM" in df.columns:
-                    m2 = (df["OFFEXAM"] == 0)
-                    mask = m2 if mask is None else (mask | m2)
-            if mask is not None:
-                out = out.loc[mask.values]
-        else:
-            out = out.loc[idx]
-
+        # Clean up and parse dates
         out = out.dropna(subset=["PATNO", "TEST_DATUM", f"UPDRS_{state}"]).copy()
         out = safe_parse_dates(out, cols=["TEST_DATUM"], dayfirst=True, report=False)
-        return out[["PATNO", "TEST_DATUM", f"UPDRS_{state}"]]
+
+        # Return with EVENT_ID if present
+        base_cols = ["PATNO", "TEST_DATUM", f"UPDRS_{state}"]
+        if "EVENT_ID" in out.columns:
+            base_cols.insert(1, "EVENT_ID")
+
+        return out[base_cols]
+
 
     def _ledd_nearest_per_visit(
         self,
@@ -918,47 +916,79 @@ class Data:
         if miss_diag is None or miss_diag.any():
             ppmi_df.loc[miss_diag.fillna(True), "TimeSinceDiagYears"] = (ppmi_df.loc[miss_diag.fillna(True), "TimeSinceBaselineDays"] / 365.25)
 
-       # ---- Attach UPDRS_{state} per visit (EVENT_ID first; fallback by date) ----
+        # ---- Attach UPDRS_{state} per visit (EVENT_ID first; fallback by date) ----
+        
         if use_updrs and "mds_updrs" in ppmi_cd:
             up = ppmi_cd["mds_updrs"].get("mds_updrs3")
             if up is not None and not up.empty:
-                off_on = self._get_updrs3_by_state(up, state=state)  # PATNO, TEST_DATUM, [EVENT_ID], UPDRS_on/off
-                off_on = safe_parse_dates(off_on, cols=["TEST_DATUM"], dayfirst=True, report=False)
-        
+                on_tbl = self._get_updrs3_by_state(up, state=state)  # PATNO, TEST_DATUM, [EVENT_ID], UPDRS_on/off
+                on_tbl = safe_parse_dates(on_tbl, cols=["TEST_DATUM"], dayfirst=True, report=False)
+
                 # 1) EVENT_ID exact join (preferred)
-                if "EVENT_ID" in ppmi_df.columns and "EVENT_ID" in off_on.columns:
+                if "EVENT_ID" in ppmi_df.columns and "EVENT_ID" in on_tbl.columns:
                     ppmi_df = ppmi_df.merge(
-                        off_on[["PATNO", "EVENT_ID", updrs_col]],
+                        on_tbl[["PATNO", "EVENT_ID", "TEST_DATUM", updrs_col]],
                         on=["PATNO", "EVENT_ID"],
-                        how="left"
+                        how="left",
+                        suffixes=("", "_ONJ")
                     )
                 else:
-                    # Ensure the column exists for downstream code
-                    ppmi_df[updrs_col] = np.nan
-        
+                    if updrs_col not in ppmi_df.columns:
+                        ppmi_df[updrs_col] = np.nan
+
                 # 2) Fallback by date proximity ONLY for rows still missing UPDRS
-                need_fallback = ppmi_df[ppmi_df[updrs_col].isna()][["PATNO", "TEST_DATUM"]].copy()
-                if not need_fallback.empty:
-                    off_on2 = off_on.rename(columns={"TEST_DATUM": "UPDRS_TEST_DATUM"})
-                    fb = need_fallback.merge(off_on2, on="PATNO", how="left")
+                need = ppmi_df[ppmi_df[updrs_col].isna()][["PATNO", "TEST_DATUM"]].copy()
+                if not need.empty:
+                    # rename to UPDRS_TEST_DATUM for delta calc
+                    tmp = on_tbl.rename(columns={"TEST_DATUM": "UPDRS_TEST_DATUM"})
+                    fb = need.merge(tmp[["PATNO", "UPDRS_TEST_DATUM", updrs_col]], on="PATNO", how="left")
                     fb["d"] = (fb["UPDRS_TEST_DATUM"] - fb["TEST_DATUM"]).dt.days
-        
-                    window = 365  # more forgiving than 180
-                    fb = fb.loc[fb["d"].abs() <= window].copy()
+
+                    # be generous; PPMI visits drift — ±365d works well empirically
+                    fb = fb.loc[fb["d"].abs() <= 365].copy()
                     if not fb.empty:
                         fb["abs_d"] = fb["d"].abs()
-                        fb["past_first"] = (fb["d"] > 0).astype(int)   # 0 = past/same-day preferred
+                        fb["past_first"] = (fb["d"] > 0).astype(int)  # 0 = past/same-day preferred
                         fb = fb.sort_values(["PATNO", "TEST_DATUM", "abs_d", "past_first"])
                         fb = fb.drop_duplicates(subset=["PATNO", "TEST_DATUM"], keep="first")
-                        # fill only missing slots
+                        # fill only where still missing
                         ppmi_df = ppmi_df.merge(
                             fb[["PATNO", "TEST_DATUM", updrs_col]],
-                            on=["PATNO", "TEST_DATUM"], how="left", suffixes=("", "_fb")
+                            on=["PATNO", "TEST_DATUM"], how="left", suffixes=("", "_FB")
                         )
-                        mask = ppmi_df[updrs_col].isna() & ppmi_df[f"{updrs_col}_fb"].notna()
-                        ppmi_df.loc[mask, updrs_col] = ppmi_df.loc[mask, f"{updrs_col}_fb"]
-                        ppmi_df.drop(columns=[f"{updrs_col}_fb"], inplace=True, errors="ignore")
-        
+                        mask = ppmi_df[updrs_col].isna() & ppmi_df[f"{updrs_col}_FB"].notna()
+                        ppmi_df.loc[mask, updrs_col] = ppmi_df.loc[mask, f"{updrs_col}_FB"]
+                        ppmi_df.drop(columns=[f"{updrs_col}_FB"], inplace=True, errors="ignore")
+
+                # quick coverage debug
+                print(f"[DEBUG] PPMI visits: {len(ppmi_df)} | UPDRS {state.upper()} attached: {ppmi_df[updrs_col].notna().sum()} "
+                      f"({ppmi_df[updrs_col].notna().mean():.2%})")
+
+        # ---- STRICT ON-only pool with per-patient coverage ≥90% ----
+        if use_updrs:
+            if "UPDRS_on" not in ppmi_df.columns:
+                raise ValueError("UPDRS_on column is missing after attachment – cannot proceed with ON-only matching.")
+
+            # 1) Keep only visits where UPDRS_on is present
+            ppmi_df["has_on"] = ppmi_df["UPDRS_on"].notna()
+
+            # 2) Compute per-patient ON coverage and keep patients with ≥90% ON availability
+            on_cov = ppmi_df.groupby("PATNO")["has_on"].mean()
+            eligible_patnos = on_cov[on_cov >= 0.90].index
+
+            ppmi_df = ppmi_df[ppmi_df["PATNO"].isin(eligible_patnos)].copy()
+            ppmi_df = ppmi_df[ppmi_df["has_on"]].copy()
+            ppmi_df.drop(columns=["has_on"], inplace=True)
+
+            # 3) Also require ON in the treated/custom cohort rows used for propensity
+            if "UPDRS_on" in custom_df.columns:
+                custom_df = custom_df[custom_df["UPDRS_on"].notna()].copy()
+
+            # Debug: show how much we kept
+            kept_frac = len(ppmi_df) / float(len(on_cov.index)) if len(on_cov.index) else 0.0
+            print(f"[DEBUG] ON-only filter: eligible PPMI patients ≥90% ON: {len(eligible_patnos)} "
+                  f"| visits kept: {len(ppmi_df)} | mean ON coverage among eligibles: {on_cov.loc[eligible_patnos].mean():.2%}")
+
         # ---- Build propensity inputs (ONLY pre-treatment covariates) ----
         covars = ["TimeSinceDiagYears"]
         if use_updrs and updrs_col in ppmi_df.columns:
