@@ -388,10 +388,11 @@ class Data:
     def _compute_ledd_pre(
         medication_df: Optional[pd.DataFrame],
         op_dates: pd.Series,
-        max_days: int = int(round(365.25 * 1.5))
+        max_days: int = int(round(365.25 * 2))
     ) -> pd.Series:
-        """
-        Return LEDD measurement closest (but not after) OP_DATUM per patient within ~1.5 years.
+        """Return the pre-surgery LEDD measurement closest (but not after) OP_DATUM within the allowed window.
+
+        The default window is roughly two years (±730 days).
         """
         if medication_df is None or medication_df.empty:
             return pd.Series(dtype=float)
@@ -659,9 +660,14 @@ class Data:
         if med.empty:
             return pd.Series(index=visits.index, dtype=float, name=out_col)
 
+        if pd.api.types.is_datetime64tz_dtype(med["MEAS_DATE"].dtype):
+            med["MEAS_DATE"] = med["MEAS_DATE"].dt.tz_localize(None)
+
         V = visits[["PATNO", "TEST_DATUM"]].copy()
         V = safe_parse_dates(V, cols=["TEST_DATUM"], dayfirst=True, report=False).dropna(subset=["TEST_DATUM"])
         V["_row"] = V.index
+        if not V.empty and pd.api.types.is_datetime64tz_dtype(V["TEST_DATUM"].dtype):
+            V["TEST_DATUM"] = V["TEST_DATUM"].dt.tz_localize(None)
 
         # Join per patient, compute deltas
         merged = med.merge(V, on="PATNO", how="inner")
@@ -753,8 +759,9 @@ class Data:
                 merged.sort_values("UPDRSET_dist")
                 .groupby(["PATNO", "TEST_DATUM"], as_index=False)
                 .first()
-                .dropna()
+                .dropna(subset=[f"UPDRS_{state}", "UPDRS_TEST_DATUM"])
             )
+            pc_df = pc_df.copy()
 
         # baseline & follow-up
         pc_df_bl = pc_df[pc_df["TimeSinceSurgery"] <= 0].copy()
