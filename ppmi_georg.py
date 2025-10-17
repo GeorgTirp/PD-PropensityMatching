@@ -1172,8 +1172,21 @@ class Data:
             out["COHORT"] = who
             return out
 
-        matched_custom = keep_cols(matched_custom, "CUSTOM").reset_index(drop=True)
-        matched_ppmi   = keep_cols(matched_ppmi,   "PPMI").reset_index(drop=True)
+        # ---- Enforce MoCA naming consistency (_sum_pre / _sum_post) ----
+        def _standardize_moca_suffixes(df: pd.DataFrame) -> pd.DataFrame:
+            newcols = {}
+            for c in df.columns:
+                if c.startswith("MoCA_"):
+                    # normalize any trailing _pre or _post to _sum_pre / _sum_post
+                    if c.endswith("_pre") and not c.endswith("_sum_pre"):
+                        newcols[c] = c.replace("_pre", "_sum_pre")
+                    elif c.endswith("_post") and not c.endswith("_sum_post"):
+                        newcols[c] = c.replace("_post", "_sum_post")
+                # leave everything else unchanged
+            return df.rename(columns=newcols)
+
+        matched_custom = _standardize_moca_suffixes(matched_custom)
+        matched_ppmi   = _standardize_moca_suffixes(matched_ppmi)
 
         # ---- Simple balance diagnostics: SMDs pre vs post (robust)
         def _smd(a: pd.Series, b: pd.Series) -> float:
