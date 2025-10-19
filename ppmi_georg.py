@@ -1261,12 +1261,23 @@ class Data:
         ppmi_model = ppmi_df_pairs.copy()
         ppmi_model = ppmi_model.rename(columns={"TEST_DATUM_pre": "TEST_DATUM"})  # use baseline date as TEST_DATUM
 
-        covars = ["TimeSinceDiag", "TimeSinceSurgery"]
+        covars = ["TimeSinceDiag"]
         if use_updrs and updrs_col in ppmi_model.columns:
             covars.append(updrs_col)
 
         # baseline MoCA (if present)
-        moca_baseline_cols = [c for c in ["MoCA_sum_pre"] if c in ppmi_model.columns]
+        moca_covars = moca_covariates_pre = [
+            #"MoCA_Abstraktion_sum_pre",
+            #"MoCA_Aufmerksamkeit_sum_pre",
+            #"MoCA_Benennen_sum_pre",
+            #"MoCA_Erinnerung_sum_pre",
+            #"MoCA_Executive_sum_pre",
+            #"MoCA_Orientierung_sum_pre",
+            #"MoCA_Sprache_sum_pre",
+            "MoCA_sum_pre",  # total (optional, include if present)
+        ]
+
+        moca_baseline_cols = [c for c in moca_covars if c in ppmi_model.columns]
         covars.extend(moca_baseline_cols)
 
         # Ensure covariates exist in custom_df (placeholder if missing)
