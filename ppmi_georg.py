@@ -1878,9 +1878,9 @@ if __name__ == "__main__":
     summary = ppmi_data.save_eligible_under_calipers(
         custom_csv,
         ppmi_csv,
-        time_tolerance_days=120,     # your time window
+        time_tolerance_days=60,     # your time window
         use_logit_caliper=True,      # classic choice
-        caliper_multiplier=0.2,      # 0.2 × SD(logit)
+        caliper_multiplier=0.05,      # 0.05 × SD(logit)
         custom_id_col="PATNO",
         control_id_col="PATNO",
         propensity_col="propensity", # column with p; set None if you already have a logit col
