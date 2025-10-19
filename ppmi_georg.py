@@ -1063,7 +1063,7 @@ class Data:
         return pd.Series(d, index=X.index)
 
 
-        # ---------- Matching: non-DBS ----------
+            # ---------- Matching: non-DBS ----------
     def match_non_dbs(
             self,
             csv_path: str,
@@ -1078,13 +1078,12 @@ class Data:
         ) -> Dict[str, pd.DataFrame]:
         """
         Safe non-DBS matching:
-        - Propensity uses ONLY pre-treatment covariates (UPDRS_{state} + MoCA_sum_pre if present).
+        - Propensity uses ONLY pre-treatment covariates (UPDRS_{state}, MoCA_sum_pre if present,
+          and now optionally LEDD_pre + AGE_AT_BASELINE when available).
         - Hard caliper on visit-time alignment (± time_tolerance_days).
         - Logit-propensity caliper (± logit_caliper_sd * SD(logit)); unmatched treated visits are skipped.
         - Deterministic greedy 1:1 matching (optionally with replacement), or iterative selector when flag set.
         - Returns matched rows + pair diagnostics + SMD balance table + imputation summary.
-
-        NOTE: No MoCA outcomes are used to *fit* propensity; they’re just carried through.
         """
 
         # --- tiny local helper so this function is self-contained ---
@@ -1129,6 +1128,7 @@ class Data:
         # Coalesce/ensure TEST_DATUM on the custom cohort (handles files that only have INFODT)
         custom_df = _coalesce_visit_date(custom_df, out_col="TEST_DATUM",
                                          prefer=("TEST_DATUM", "EXAMDT", "INFODT"))
+
         # Recover TEST_DATUM if only OP_DATUM + TimeSinceSurgery present
         if "TEST_DATUM" not in custom_df.columns or custom_df["TEST_DATUM"].isna().all():
             if "OP_DATUM" in custom_df.columns and "TimeSinceSurgery" in custom_df.columns:
@@ -1154,12 +1154,30 @@ class Data:
         custom_df["TimeSinceBaselineDays"]  = (custom_df["TEST_DATUM"] - first_test).dt.days
         custom_df["TimeSinceBaselineYears"] = custom_df["TimeSinceBaselineDays"] / 365.25
 
+        # ----- Attach/standardize optional covariates on CUSTOM: LEDD_pre and AGE_AT_BASELINE -----
+        # LEDD_pre: if already present, keep; otherwise leave NaN (unless you have a custom meds table to compute from)
+        if "LEDD_pre" not in custom_df.columns:
+            custom_df["LEDD_pre"] = np.nan  # placeholder; keeps pipeline consistent
+
+        # AGE_AT_BASELINE: prefer an existing numeric Age column; else compute from BIRTHDT if present
+        if "AGE_AT_BASELINE" in custom_df.columns:
+            custom_df["AGE_AT_BASELINE"] = pd.to_numeric(custom_df["AGE_AT_BASELINE"], errors="coerce")
+        else:
+            age_like = [c for c in custom_df.columns if c.upper() in {"AGE", "AGE_AT_OP", "AGE_AT_BASELINE"}]
+            if age_like:
+                custom_df["AGE_AT_BASELINE"] = pd.to_numeric(custom_df[age_like[0]], errors="coerce")
+            elif "BIRTHDT" in custom_df.columns:
+                custom_df = safe_parse_dates(custom_df, cols=["BIRTHDT"], dayfirst=True, report=False)
+                custom_df["AGE_AT_BASELINE"] = (custom_df["TEST_DATUM"] - custom_df["BIRTHDT"]).dt.days / 365.25
+            else:
+                custom_df["AGE_AT_BASELINE"] = np.nan
+
         # ---- Guard: only MoCA is supported downstream ----
         if quest.lower() != "moca":
             raise NotImplementedError("Non-DBS matching currently supports quest='moca' only.")
 
         # ---- Load PPMI (DBS=False) and build per-visit frame ----
-        raw = self.load_ppmi()
+        raw = self.load_ppmi()                         # keep the RAW (has Demographics with BIRTHDT)
         ppmi_cd = self.convert_to_standard_keys(raw, DBS=False)
 
         # Prepare MoCA+demo and coalesce visit date to TEST_DATUM (INFODT/EXAMDT → TEST_DATUM)
@@ -1190,6 +1208,27 @@ class Data:
         if "TimeSinceDiagYears" in ppmi_df.columns and "TimeSinceDiag" in ppmi_df.columns:
             ppmi_df.drop(columns=["TimeSinceDiagYears"], inplace=True)
 
+        # ---- Attach LEDD_pre per visit (nearest prior ± ~2y) ----
+        ppmi_df["LEDD_pre"] = self._ledd_nearest_per_visit(
+            medication_df=ppmi_cd.get("medication"),
+            visits=ppmi_df[["PATNO", "TEST_DATUM"]],
+            max_days=int(round(365.25 * 2)),
+            prefer_past=True,
+            out_col="LEDD_pre"
+        )
+
+        # ---- Attach AGE_AT_BASELINE from RAW demographics (BIRTHDT) ----
+        raw_demo = raw.get("demo", pd.DataFrame())  # RAW (from load_ppmi), includes BIRTHDT
+        if not raw_demo.empty and "BIRTHDT" in raw_demo.columns and "PATNO" in raw_demo.columns:
+            raw_demo = safe_parse_dates(raw_demo, cols=["BIRTHDT"], dayfirst=True, report=False)
+            base_age = raw_demo[["PATNO", "BIRTHDT"]].dropna()
+            ppmi_df = ppmi_df.merge(base_age, on="PATNO", how="left")
+            ppmi_df["AGE_AT_BASELINE"] = (ppmi_df["TEST_DATUM"] - ppmi_df["BIRTHDT"]).dt.days / 365.25
+            ppmi_df.drop(columns=["BIRTHDT"], inplace=True, errors="ignore")
+        else:
+            # Fallback: keep missing; median imputation will handle it if included
+            ppmi_df["AGE_AT_BASELINE"] = np.nan
+
         # ---- Attach UPDRS_{state} per visit (EVENT_ID first; fallback by unified TEST_DATUM) ----
         if use_updrs and "mds_updrs" in ppmi_cd:
             up = ppmi_cd["mds_updrs"].get("mds_updrs3")
@@ -1211,7 +1250,6 @@ class Data:
                         suffixes=("", "_ONJ")
                     )
                 else:
-                    # ensure column exists for downstream filters
                     if updrs_col not in ppmi_df.columns:
                         ppmi_df[updrs_col] = np.nan
 
@@ -1256,29 +1294,43 @@ class Data:
             print(f"[DEBUG] ON-only filter: eligible PPMI patients ≥50% ON: {len(eligible_patnos)} "
                   f"| visits kept: {len(ppmi_df)} | mean ON coverage among eligibles: {on_cov.loc[eligible_patnos].mean():.2%}")
 
-        # ---- Build propensity inputs (ONLY pre-treatment covariates) ----
+        # ---- Build PPMI baseline→follow-up *pairs* (keeps all valid combos) ----
         ppmi_df_pairs = self._build_ppmi_timeline_pairs(ppmi_df)   # produces *_pre / *_post, base TEST_DATUM_pre
         ppmi_model = ppmi_df_pairs.copy()
-        ppmi_model = ppmi_model.rename(columns={"TEST_DATUM_pre": "TEST_DATUM"})  # use baseline date as TEST_DATUM
 
-        covars = ["TimeSinceDiag"]
+        # Bring baseline LEDD_pre and AGE_AT_BASELINE from the per-visit table into the pairs table
+        base_cov = ppmi_df[["PATNO", "TEST_DATUM", "LEDD_pre", "AGE_AT_BASELINE"]].drop_duplicates()
+        ppmi_model = ppmi_model.merge(
+            base_cov.rename(columns={"TEST_DATUM": "TEST_DATUM_pre"}),
+            on=["PATNO", "TEST_DATUM_pre"],
+            how="left"
+        )
+
+        # Prefer using the follow-up date for TEST_DATUM (your latest convention), but keep baseline in TEST_DATUM_pre
+        ppmi_model = ppmi_model.rename(columns={"TEST_DATUM_post": "TEST_DATUM"})
+
+        # ---- Build propensity inputs (ONLY pre-treatment covariates) ----
+        covars = ["TimeSinceDiag"]    # always present from the baseline side
         if use_updrs and updrs_col in ppmi_model.columns:
             covars.append(updrs_col)
 
-        # baseline MoCA (if present)
-        moca_covars = moca_covariates_pre = [
-            #"MoCA_Abstraktion_sum_pre",
+        # Baseline MoCA (if present)
+        moca_covars = [
+            #"MoCA_sum_pre",
             #"MoCA_Aufmerksamkeit_sum_pre",
-            #"MoCA_Benennen_sum_pre",
-            #"MoCA_Erinnerung_sum_pre",
-            #"MoCA_Executive_sum_pre",
-            #"MoCA_Orientierung_sum_pre",
+            "MoCA_Erinnerung_sum_pre",
             #"MoCA_Sprache_sum_pre",
-            "MoCA_sum_pre",  # total (optional, include if present)
+            #"MoCA_Abstraktion_sum_pre",
+            "MoCA_Executive_sum_pre",
+            #"MoCA_Benennen_sum_pre"
         ]
+        covars.extend([c for c in moca_covars if c in ppmi_model.columns])
 
-        moca_baseline_cols = [c for c in moca_covars if c in ppmi_model.columns]
-        covars.extend(moca_baseline_cols)
+        # New optional covariates (add if present)
+        #if "LEDD_pre" in ppmi_model.columns:
+        #    covars.append("LEDD_pre")
+        #if "AGE_AT_BASELINE" in ppmi_model.columns:
+        #    covars.append("AGE_AT_BASELINE")
 
         # Ensure covariates exist in custom_df (placeholder if missing)
         for c in covars:
@@ -1304,8 +1356,12 @@ class Data:
                     ("sc", StandardScaler())
                 ]), covars)
             ], remainder="drop", verbose_feature_names_out=False)),
-            ("logit", LogisticRegression(solver="liblinear", C=1.0, max_iter=2000,
-                                         class_weight="balanced", random_state=42))
+            ("logit", LogisticRegression(
+                solver="liblinear", 
+                C=1.0, 
+                max_iter=2000,
+                class_weight="balanced"
+                ))
         ])
 
         # Design matrices BEFORE fitting
@@ -1351,8 +1407,6 @@ class Data:
         p_ppmi   = prop_model.predict_proba(X_ppmi)[:, 1]
 
         eps = 1e-6
-        logit_fn = lambda p: np.log(np.clip(p, eps, 1 - p, eps) / np.clip(1 - p, eps, 1 - p, eps))
-        # small fix: clip both numerator and denominator separately (done above)
         l_custom = np.log(np.clip(p_custom, eps, 1 - eps) / np.clip(1 - p_custom, eps, 1 - eps))
         l_ppmi   = np.log(np.clip(p_ppmi,   eps, 1 - eps) / np.clip(1 - p_ppmi,   eps, 1 - eps))
         sd_logit = np.std(np.concatenate([l_custom, l_ppmi]))
@@ -1365,6 +1419,7 @@ class Data:
         def keep_cols(df, who: str):
             keep = [c for c in df.columns if c.startswith("MoCA_")]  # all MoCA
             for c in ["TimeSinceDiag", updrs_col, updrs_col.upper() if updrs_col.upper()!=updrs_col else updrs_col,
+                      "LEDD_pre", "AGE_AT_BASELINE",
                       "PATNO", id_column, "TEST_DATUM", "propensity", "logit",
                       "matched_ppmi_patno", "matched_ppmi_index", "matched_custom_id", "matched_custom_index"]:
                 if c in df.columns and c not in keep:
@@ -1525,6 +1580,10 @@ class Data:
         covs_for_smd = ["TimeSinceDiag"] if "TimeSinceDiag" in ppmi_model.columns else []
         if updrs_col in ppmi_model.columns:
             covs_for_smd.append(updrs_col)
+        if "LEDD_pre" in ppmi_model.columns:
+            covs_for_smd.append("LEDD_pre")
+        if "AGE_AT_BASELINE" in ppmi_model.columns:
+            covs_for_smd.append("AGE_AT_BASELINE")
 
         pre_t = custom_model[covs_for_smd] if covs_for_smd else pd.DataFrame(index=custom_model.index)
         pre_c = ppmi_model[covs_for_smd]   if covs_for_smd else pd.DataFrame(index=ppmi_model.index)
@@ -1573,19 +1632,193 @@ class Data:
         pass
 
 
-# ---------- Optional: example main ----------
+    def save_eligible_under_calipers(
+        self,
+        custom_csv: str,
+        control_csv: str,
+        *,
+        # calipers
+        time_tolerance_days: int = 120,
+        use_logit_caliper: bool = True,
+        caliper_multiplier: float = 0.2,   # 0.2 × SD(logit) = classic rule
+        # schema hints (auto-detected if possible)
+        custom_id_col: str = "PATNO",
+        control_id_col: str = "PATNO",
+        propensity_col: str | None = "propensity",   # if None, try to infer
+        logit_col: str | None = None,                # if present, will be used directly
+        time_col: str | None = "TimeSinceBaselineDays",  # if None, derive from dates
+        date_candidates: tuple[str, ...] = ("TEST_DATUM", "EXAMDT", "INFODT"),
+        # output
+        out_dir: str | None = None,   # default: same dir as each input file
+    ) -> dict:
+        """
+        Create *eligibility filters* (not full matching):
+        - A treated row is kept if it has >=1 control within both calipers.
+        - A control row is kept if it is eligible for >=1 treated row.
+        Saves: eligible_<basename(custom_csv)>, eligible_<basename(control_csv)>.
+        Returns counts & file paths.
+        """
+
+        # ---------- helpers ----------
+        def _first_present(df: pd.DataFrame, cols: tuple[str, ...]) -> str | None:
+            for c in cols:
+                if c in df.columns:
+                    return c
+            return None
+
+        def _ensure_time_since_baseline(df: pd.DataFrame, id_col: str) -> pd.DataFrame:
+            """Ensure numeric TimeSinceBaselineDays. If absent, build from the first available date col."""
+            nonlocal time_col
+            if time_col and time_col in df.columns:
+                return df
+
+            # pick a date column
+            dcol = _first_present(df, date_candidates)
+            if dcol is None:
+                raise ValueError("No time variable found: either provide `time_col` or one of "
+                                 f"{date_candidates} must be present to compute TimeSinceBaselineDays.")
+
+            # parse and compute per-id baseline
+            tmp = df.copy()
+            tmp[dcol] = pd.to_datetime(tmp[dcol], errors="coerce")
+            if tmp[dcol].isna().all():
+                raise ValueError(f"Could not parse any dates in column {dcol} to compute TimeSinceBaselineDays.")
+            tmp = tmp.dropna(subset=[dcol])
+            first_dt = tmp.groupby(id_col)[dcol].transform("min")
+            tmp["TimeSinceBaselineDays"] = (tmp[dcol] - first_dt).dt.days
+            return tmp
+
+        def _ensure_logit(df: pd.DataFrame) -> pd.DataFrame:
+            """Ensure 'logit' column exists, using either existing logit_col or a propensity column."""
+            nonlocal propensity_col, logit_col
+            out = df.copy()
+            if logit_col and logit_col in out.columns:
+                out["logit"] = pd.to_numeric(out[logit_col], errors="coerce")
+                return out
+
+            # find propensity
+            if propensity_col is None or propensity_col not in out.columns:
+                # try to infer a reasonable name if not present
+                guesses = ("propensity", "pscore", "p_score", "p")
+                propensity_col = _first_present(out, guesses)
+                if propensity_col is None:
+                    raise ValueError("No propensity probability found. Provide `propensity_col` or include one of "
+                                     f"{guesses} in the CSV.")
+
+            p = pd.to_numeric(out[propensity_col], errors="coerce").clip(0, 1)
+            eps = 1e-6
+            out["logit"] = np.log(np.clip(p, eps, 1 - eps) / np.clip(1 - p, eps, 1 - eps))
+            return out
+
+        def _load_and_prepare(path: str, id_col: str) -> pd.DataFrame:
+            df = pd.read_csv(path)
+            if id_col not in df.columns:
+                raise ValueError(f"{os.path.basename(path)} is missing id column '{id_col}'")
+            df = _ensure_time_since_baseline(df, id_col)
+            df = _ensure_logit(df)
+            # Keep only rows that have both measures
+            df = df.dropna(subset=["TimeSinceBaselineDays", "logit"]).copy()
+            return df
+
+        # ---------- load & prepare ----------
+        T = _load_and_prepare(custom_csv, custom_id_col)
+        C = _load_and_prepare(control_csv, control_id_col)
+
+        # ---------- choose logit caliper ----------
+        if use_logit_caliper:
+            sd_logit = float(np.std(np.concatenate([T["logit"].values, C["logit"].values])))
+            caliper = caliper_multiplier * sd_logit if sd_logit > 0 else np.inf
+        else:
+            sd_logit = float(np.std(np.concatenate([T["logit"].values, C["logit"].values])))
+            caliper = np.inf
+
+        # ---------- eligibility: treated with >=1 eligible control ----------
+        # (naive O(N*M) pass; okay for moderate sizes)
+        eligible_t_mask = pd.Series(False, index=T.index, dtype=bool)
+        n_cands_series  = pd.Series(0,     index=T.index, dtype=int)
+        
+        for i, r in T.iterrows():
+            ok = (
+                (np.abs(C["logit"] - r["logit"]) <= caliper) &
+                (np.abs(C["TimeSinceBaselineDays"] - r["TimeSinceBaselineDays"]) <= time_tolerance_days)
+            )
+            n = int(ok.sum())
+            n_cands_series.at[i] = n
+            if n > 0:
+                eligible_t_mask.at[i] = True
+        
+        T_eligible = T.loc[eligible_t_mask].copy()
+        T_eligible["n_candidates"] = n_cands_series.loc[T_eligible.index].values
+
+        # ---------- eligibility: controls eligible for >=1 treated ----------
+        # Build by symmetry (this is faster using broadcasting bins, but keep it simple/clear)
+        eligible_c_mask = np.zeros(len(C), dtype=bool)
+        counts_c = np.zeros(len(C), dtype=int)
+
+        for _, r in T.iterrows():
+            ok = (
+                (np.abs(C["logit"] - r["logit"]) <= caliper) &
+                (np.abs(C["TimeSinceBaselineDays"] - r["TimeSinceBaselineDays"]) <= time_tolerance_days)
+            ).values
+            eligible_c_mask |= ok
+            counts_c += ok.astype(int)
+
+        C_eligible = C.loc[eligible_c_mask].copy()
+        C_eligible["n_treated_that_match"] = counts_c[eligible_c_mask]
+
+        # ---------- save ----------
+        def _out_path(in_path: str) -> str:
+            base = os.path.basename(in_path)
+            folder = os.path.dirname(in_path) if out_dir is None else out_dir
+            return os.path.join(folder, f"eligible_{base}")
+
+        out_custom = _out_path(custom_csv)
+        out_control = _out_path(control_csv)
+        T_eligible.to_csv(out_custom, index=False)
+        C_eligible.to_csv(out_control, index=False)
+
+        # ---------- report ----------
+        msg = (
+            f"[Eligibility summary]\n"
+            f"  Treated with ≥1 eligible control: {len(T_eligible)} / {len(T)} "
+            f"({len(T_eligible)/max(1,len(T)):.1%})\n"
+            f"  Controls eligible for ≥1 treated: {len(C_eligible)} / {len(C)} "
+            f"({len(C_eligible)/max(1,len(C)):.1%})\n"
+            f"  Time caliper: ±{time_tolerance_days} days\n"
+            f"  Logit caliper: {'ON' if use_logit_caliper else 'OFF'} "
+            f"(SD(logit)={sd_logit:.3f}, multiplier={caliper_multiplier}, width={caliper if np.isfinite(caliper) else float('inf'):.3f})\n"
+            f"  Saved:\n"
+            f"    - {out_custom}\n"
+            f"    - {out_control}"
+        )
+        print(msg)
+
+        return {
+            "treated_total": int(len(T)),
+            "treated_eligible": int(len(T_eligible)),
+            "control_total": int(len(C)),
+            "control_eligible": int(len(C_eligible)),
+            "sd_logit": sd_logit,
+            "caliper_width": float(caliper),
+            "time_tolerance_days": int(time_tolerance_days),
+            "eligible_custom_path": out_custom,
+            "eligible_control_path": out_control,
+        }
+
+    # ---------- Optional: example main ----------
 if __name__ == "__main__":
     #path_ppmi = '/home/georg-tirpitz/Documents/Neuromodulation/Parkinson_PSM/PPMI'
     #csv_path  = '/home/georg-tirpitz/Documents/Neuromodulation/ddbm/out/MOCA/level2/moca_ledd.csv'
     #std_map   = '/home/georg-tirpitz/Documents/PD-PropensityMatching/covariate_names.csv'
     path_ppmi =  "/home/georg/Documents/Neuromodulation/PPMI"
-    csv_path  = "/home/georg/Documents/Neuromodulation/PD-MultiModal-Prediction/data/MoCA/level2/moca_ledd.csv"
+    csv_path_ledd  = "/home/georg/Documents/Neuromodulation/PD-MultiModal-Prediction/data/MoCA/level2/moca_ledd.csv"
+    csv_path_updrs     = "/home/georg/Documents/Neuromodulation/PD-MultiModal-Prediction/data/MoCA/level2/moca_updrs.csv"
     std_map   = "covariate_names.csv"
     ppmi_data = Data(path_ppmi, foldertype="PPMI", covariate_names=std_map)
 
     # DBS
-    ppmi_noU = ppmi_data.match_dbs(csv_path, quest="moca", STN=True, use_updrs=False)
-    ppmi_U   = ppmi_data.match_dbs(csv_path, quest="moca", STN=True, use_updrs=True)
+    ppmi_noU = ppmi_data.match_dbs(csv_path_updrs, quest="moca", STN=True, use_updrs=False)
+    ppmi_U   = ppmi_data.match_dbs(csv_path_updrs, quest="moca", STN=True, use_updrs=True)
 
     #
     ppmi_noU = ppmi_noU[ppmi_noU["TimeSinceSurgery"] >= 0.6]
@@ -1594,7 +1827,7 @@ if __name__ == "__main__":
     ppmi_U.to_csv("ppmi_ledd.csv", index=False)
     # Non-DBS
     medication_group = ppmi_data.match_non_dbs(
-        csv_path,
+        csv_path_updrs,
         quest="moca",
         id_column="PATNO",
         time_tolerance_days=120,
@@ -1638,4 +1871,21 @@ if __name__ == "__main__":
     lost_patnos = sorted(set(ppmi_noU["PATNO"].unique()) - set(ppmi_U["PATNO"].unique()))
     out_csv = "lost_patnos_when_using_updrs.csv"
     pd.Series(lost_patnos, name="PATNO").to_csv(out_csv, index=False)
+
+    custom_csv = "matched_custom.csv"   # treated cohort file
+    ppmi_csv   = "matched_ppmi.csv"     # control cohort file
+
+    summary = ppmi_data.save_eligible_under_calipers(
+        custom_csv,
+        ppmi_csv,
+        time_tolerance_days=120,     # your time window
+        use_logit_caliper=True,      # classic choice
+        caliper_multiplier=0.2,      # 0.2 × SD(logit)
+        custom_id_col="PATNO",
+        control_id_col="PATNO",
+        propensity_col="propensity", # column with p; set None if you already have a logit col
+        logit_col=None,              # or e.g., "logit" if your csv already has logits
+        time_col="TimeSinceBaselineDays",  # leave None to compute from a date column
+        # out_dir="some/other/folder" # optional; defaults to each file’s own folder
+    )
     print(f"Saved {len(lost_patnos)} lost PATNOs to: {out_csv}")
