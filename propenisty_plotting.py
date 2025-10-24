@@ -247,35 +247,79 @@ def _load_csv(path: Path) -> pd.DataFrame:
         raise ValueError(f"{path} is empty")
     return df
 
-
 def load_groups(custom_path: Path, ppmi_path: Path) -> MatchedGroups:
     custom_df = _load_csv(custom_path)
-    ppmi_df = _load_csv(ppmi_path)
+    ppmi_df   = _load_csv(ppmi_path)
 
+    # Prefer a stable ID join if available
+    id_key_ppmi = None
+    id_key_custom = None
+    for cand in ("matched_custom_id", "matched_custom_PATNO", "matched_custom_patno"):
+        if cand in ppmi_df.columns:
+            id_key_ppmi = cand
+            break
+    # Guess the id column on the custom side
+    for cand in ("PATNO", "patno", "ID", "id", "subject_id", "matched_custom_id"):
+        if cand in custom_df.columns:
+            id_key_custom = cand
+            break
+
+    if id_key_ppmi and id_key_custom:
+        # 1:1 alignment by ID
+        ppmi_aligned = ppmi_df.dropna(subset=[id_key_ppmi]).copy()
+        ppmi_aligned[id_key_ppmi] = ppmi_aligned[id_key_ppmi].astype(str)
+        custom_df[id_key_custom]  = custom_df[id_key_custom].astype(str)
+
+        # inner-join order: follow the PPMI rows (one row per matched treated)
+        custom_aligned = custom_df.merge(
+            ppmi_aligned[[id_key_ppmi]].rename(columns={id_key_ppmi: "__join_id"}),
+            left_on=id_key_custom, right_on="__join_id", how="inner"
+        ).drop(columns="__join_id")
+
+        # Now place both in the same order keyed by ID
+        custom_aligned = custom_aligned.set_index(id_key_custom).loc[ppmi_aligned[id_key_ppmi].values]
+        ppmi_aligned   = ppmi_aligned.set_index(id_key_ppmi)
+
+        # Sanity: equal lengths
+        if len(custom_aligned) != len(ppmi_aligned):
+            raise ValueError("Aligned cohorts must have identical sizes; check for duplicate IDs.")
+        return MatchedGroups(custom=custom_aligned.reset_index(drop=False),
+                             ppmi=ppmi_aligned.reset_index(drop=False))
+
+    # --- Fallback: align by matched_custom_index (original indices from the matcher) ---
     if "matched_custom_index" not in ppmi_df.columns:
         raise ValueError(
-            "eligible PPMI file must contain 'matched_custom_index' to align with the treated cohort."
+            "PPMI file has no 'matched_custom_id' or 'matched_custom_index' to align with the treated cohort."
         )
 
-    custom_df = custom_df.reset_index().rename(columns={"index": "custom_index"})
-    match_indices = sorted(ppmi_df["matched_custom_index"].unique())
-    custom_matched = (
-        custom_df.loc[custom_df["custom_index"].isin(match_indices)]
-        .set_index("custom_index")
-        .sort_index()
-    )
-    ppmi_matched = (
-        ppmi_df.set_index("matched_custom_index")
-        .loc[custom_matched.index]
-        .sort_index()
-    )
+    # If the custom file already contains that index as a column, use it;
+    # otherwise assume the CSV preserved the original index in a column with that name.
+    if "matched_custom_index" in custom_df.columns:
+        custom_df = custom_df.set_index("matched_custom_index")
+    elif "custom_index" in custom_df.columns:
+        custom_df = custom_df.set_index("custom_index")
+    else:
+        # Best effort: do NOT reset_index; try to use the current index as-is
+        # (works only if the CSV saved the original index)
+        pass
+
+    match_indices = list(dict.fromkeys(ppmi_df["matched_custom_index"].tolist()))
+    missing = [i for i in match_indices if i not in custom_df.index]
+    if missing:
+        # Warn loudly: this is exactly what causes tiny N like 21–22
+        print(f"[WARN] {len(missing)} matched_custom_index values are not in custom_df.index "
+              f"(e.g., first few: {missing[:5]}). "
+              f"Prefer aligning by 'matched_custom_id' to avoid index drift.")
+
+    # Align in the PPMI order
+    custom_matched = custom_df.loc[[i for i in match_indices if i in custom_df.index]].copy()
+    ppmi_matched   = ppmi_df.set_index("matched_custom_index").loc[custom_matched.index].copy()
 
     if len(custom_matched) != len(ppmi_matched):
-        raise ValueError(
-            "Aligned cohorts must have identical sizes; check the matching inputs."
-        )
+        raise ValueError("Aligned cohorts must have identical sizes; check the matching inputs.")
+    return MatchedGroups(custom=custom_matched.reset_index(drop=False),
+                         ppmi=ppmi_matched.reset_index(drop=False))
 
-    return MatchedGroups(custom=custom_matched, ppmi=ppmi_matched)
 
 
 def plot_moca_radar(
@@ -490,7 +534,10 @@ def ttest_plots(
         )
 
         # Title and axis
-        ax.set_title(f"{pretty} (N = {n_pairs_shown})", loc="left", pad=12, fontsize=14)
+        # inside ttest_plots loop, after computing welch and paired
+        title_N = f"N(custom={welch['n_custom']}, ppmi={welch['n_ppmi']}, paired={paired['n_pairs']})"
+        ax.set_title(f"{pretty} — {title_N}", loc="left", pad=12, fontsize=13)
+
         ax.set_xlabel("")
         ax.set_ylabel(pretty)
         ax.yaxis.set_minor_locator(AutoMinorLocator())

@@ -747,8 +747,8 @@ class Data:
         self,
         df: pd.DataFrame,
         target_years: float = 2.0,
-        window_years: float = 1.0,
-        min_separation_days: int = 90,
+        window_years: float = 2.0,
+        min_separation_days: int = 180,
         require_updrs: bool = False,
     ) -> pd.DataFrame:
         if df is None or df.empty:
@@ -839,35 +839,64 @@ class Data:
         plt.show()
         plt.savefig(f"{cohort_name}_TimeSinceDiag_Histogram.png")
 
+    @staticmethod
     def iterative_propensity_matching(
         custom_model: pd.DataFrame,
         ppmi_model: pd.DataFrame,
         time_tolerance_days: float,
         caliper_logit: float,
+        *,
         replace: bool = False,
         batch_size: int = 500,
         random_state: int = 42,
-        ) ->     tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        # --- NEW: hard calipers ---
+        caliper_age_years: float | None = 5.0,
+        caliper_tsd_years: float | None = 2.0,
+        exact_sex: bool = False,
+        # --- NEW: weighted cost for ranking ---
+        w_logit: float = 1.0,
+        w_time: float = 0.25,
+        w_age: float = 0.75,
+        w_tsd: float = 0.50,
+        w_updrs: float = 0.25,
+    ) ->     tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """
         Iterative *selection* using precomputed 'logit' (no re-training).
-        Respects hard time caliper and a hard logit caliper.
-        Preserves original PPMI row identity via '__orig_ix'.
-        Ranking = |logit diff|, then |time diff|, then PATNO/TEST_DATUM.
+        Adds:
+          - Hard calipers on Age (AGE_AT_BASELINE) and TimeSinceDiag (years), and optional exact SEX match.
+          - Weighted cost function to rank candidates (logit, time, age, tsd, updrs).
+
+        Returns:
+          treated_matches, control_matches, pairs_df
         """
 
         rng = np.random.default_rng(random_state)
 
-        # Ensure we can map picks back to the original PPMI rows
+        # Keep a handle to the original PPMI row ids so we can return the original rows
         if "__orig_ix" not in ppmi_model.columns:
             ppmi_model = ppmi_model.copy()
             ppmi_model["__orig_ix"] = ppmi_model.index
 
-        available_ix = list(ppmi_model.index)   # working index in ppmi_model
-        treated_order = custom_model.sort_values(["TimeSinceBaselineDays", custom_model.columns[0]]).index.tolist()
+        # Working pool (indices of ppmi_model); if replace=False we remove chosen indices
+        available_ix = list(ppmi_model.index)
+
+        # Order of treated rows we iterate over (stable and reproducible)
+        t_sort_cols = ["TimeSinceBaselineDays"]
+        if "PATNO" in custom_model.columns:
+            t_sort_cols.append("PATNO")
+        else:
+            t_sort_cols.append(custom_model.columns[0])
+        treated_order = custom_model.sort_values(t_sort_cols).index.tolist()
 
         matched_treated_ix: list[int] = []
         matched_control_orig_ix: list[int] = []
         pair_rows: list[dict] = []
+
+        # Identify UPDRS column if present
+        updrs_col = (
+            "UPDRS_on" if "UPDRS_on" in ppmi_model.columns
+            else ("UPDRS_off" if "UPDRS_off" in ppmi_model.columns else None)
+        )
 
         for start in range(0, len(treated_order), batch_size):
             block = treated_order[start:start + batch_size]
@@ -879,59 +908,116 @@ class Data:
                 trow = custom_model.loc[ci]
                 pool = ppmi_model.loc[available_ix] if not replace else ppmi_model
 
-                # 1) hard time caliper
-                cand = pool[(pool["TimeSinceBaselineDays"] - trow["TimeSinceBaselineDays"]).abs() <= float(time_tolerance_days)].copy()
+                # -------------------------
+                # 1) HARD ELIGIBILITY FILTERS
+                # -------------------------
+
+                # 1a) visit-time (days) caliper
+                cand = pool[
+                    (pool["TimeSinceBaselineDays"] - trow["TimeSinceBaselineDays"]).abs()
+                    <= float(time_tolerance_days)
+                ].copy()
                 if cand.empty:
                     continue
 
-                
+                # 1b) TimeSinceDiag (years) caliper
+                if caliper_tsd_years is not None and "TimeSinceDiag" in cand.columns:
+                    tsd = trow.get("TimeSinceDiag", np.nan)
+                    cand = cand[(cand["TimeSinceDiag"] - tsd).abs() <= float(caliper_tsd_years)]
+                    if cand.empty:
+                        continue
 
-                # 2) hard logit caliper
+                # 1c) Age (years) caliper
+                if caliper_age_years is not None and "AGE_AT_BASELINE" in cand.columns:
+                    age = trow.get("AGE_AT_BASELINE", np.nan)
+                    cand = cand[(cand["AGE_AT_BASELINE"] - age).abs() <= float(caliper_age_years)]
+                    if cand.empty:
+                        continue
+
+                # 1d) exact sex match (optional)
+                if exact_sex and ("SEX" in cand.columns) and ("SEX" in trow.index):
+                    cand = cand[cand["SEX"] == trow["SEX"]]
+                    if cand.empty:
+                        continue
+
+                # 1e) logit caliper
                 cand = cand[(cand["logit"] - trow["logit"]).abs() <= float(caliper_logit)].copy()
                 if cand.empty:
                     continue
 
-                # 3) rank by closeness
+                # -------------------------
+                # 2) RANK BY WEIGHTED COST
+                # -------------------------
+
+                # Primitive diffs
                 cand["logit_diff"] = (cand["logit"] - trow["logit"]).abs()
                 cand["time_diff"]  = (cand["TimeSinceBaselineDays"] - trow["TimeSinceBaselineDays"]).abs()
 
-                # Optional extra tie-breakers if present
+                cand["diag_diff"] = np.inf
                 if "TimeSinceDiag" in cand.columns:
-                    diag_diff = np.abs(cand["TimeSinceDiag"] - trow.get("TimeSinceDiag", np.nan))
-                    cand["diag_diff"] = np.nan_to_num(diag_diff, nan=np.inf)
-                else:
-                    cand["diag_diff"] = np.inf
+                    cand["diag_diff"] = np.abs(cand["TimeSinceDiag"] - trow.get("TimeSinceDiag", np.nan))
 
-                updrs_col = "UPDRS_on" if "UPDRS_on" in cand.columns else ("UPDRS_off" if "UPDRS_off" in cand.columns else None)
-                if updrs_col is not None:
-                    u_diff = np.abs(cand[updrs_col] - trow.get(updrs_col, np.nan))
-                    cand["updrs_diff"] = np.nan_to_num(u_diff, nan=np.inf)
-                else:
-                    cand["updrs_diff"] = np.inf
+                cand["age_diff"] = np.inf
+                if "AGE_AT_BASELINE" in cand.columns:
+                    cand["age_diff"] = np.abs(cand["AGE_AT_BASELINE"] - trow.get("AGE_AT_BASELINE", np.nan))
 
-                cand = cand.sort_values(["logit_diff", "time_diff", "diag_diff", "updrs_diff", "PATNO", "TEST_DATUM"])
+                cand["updrs_diff"] = np.inf
+                if updrs_col is not None and updrs_col in cand.columns:
+                    cand["updrs_diff"] = np.abs(cand[updrs_col] - trow.get(updrs_col, np.nan))
 
-                chosen_pi = int(cand.index[0])
+                # Normalization to comparable scales
+                eps = 1e-9
+                cand["time_z"]  = cand["time_diff"]  / (float(time_tolerance_days) + eps)
+                cand["age_z"]   = cand["age_diff"]   / (
+                    float(caliper_age_years) + eps if caliper_age_years else (cand["age_diff"].max() + 1.0)
+                )
+                cand["tsd_z"]   = cand["diag_diff"]  / (
+                    float(caliper_tsd_years) + eps if caliper_tsd_years else (cand["diag_diff"].max() + 1.0)
+                )
+                cand["updrs_z"] = cand["updrs_diff"] / (cand["updrs_diff"].max() + 1.0)
+
+                # Weighted cost (lower is better)
+                cand["cost"] = (
+                    w_logit * cand["logit_diff"]
+                    + w_time  * cand["time_z"]
+                    + w_age   * cand["age_z"]
+                    + w_tsd   * cand["tsd_z"]
+                    + w_updrs * cand["updrs_z"]
+                )
+
+                chosen_pi = int(cand.sort_values(["cost", "PATNO", "TEST_DATUM"]).index[0])
                 chosen = cand.loc[chosen_pi]
 
                 matched_treated_ix.append(ci)
                 matched_control_orig_ix.append(int(chosen["__orig_ix"]))
                 pair_rows.append({
                     "custom_index": int(ci),
-                    "ppmi_index": int(chosen_pi),              # index in the working ppmi_model
-                    "ppmi_orig_index": int(chosen["__orig_ix"]),  # original index for recovery
+                    "ppmi_index": int(chosen_pi),                 # index in working ppmi_model
+                    "ppmi_orig_index": int(chosen["__orig_ix"]),  # original ppmi_df_pairs index
                     "time_diff_days": float(chosen["time_diff"]),
                     "logit_diff": float(chosen["logit_diff"]),
+                    "age_diff": float(chosen.get("age_diff", np.nan)),
+                    "tsd_diff": float(chosen.get("diag_diff", np.nan)),
                 })
 
                 if not replace and chosen_pi in available_ix:
                     available_ix.remove(chosen_pi)
 
-        # Build outputs
+        # -------------------------
+        # 3) BUILD OUTPUT TABLES
+        # -------------------------
         treated_matches = custom_model.loc[matched_treated_ix].copy().reset_index(drop=True)
-        control_matches = ppmi_model.set_index("__orig_ix").loc[matched_control_orig_ix].copy().reset_index(drop=True)
+        # recover the original ppmi rows by __orig_ix to keep all original columns
+        control_matches = (
+            ppmi_model.set_index("__orig_ix")
+            .loc[matched_control_orig_ix]
+            .copy()
+            .reset_index(drop=True)
+        )
         pairs = pd.DataFrame(pair_rows)
+
         return treated_matches, control_matches, pairs
+
 
     # ---------- Matching: DBS ----------
     def match_dbs(
@@ -1075,7 +1161,7 @@ class Data:
         return pd.Series(d, index=X.index)
 
 
-    # ---------- Matching: non-DBS ----------
+        # ---------- Matching: non-DBS ----------
     def match_non_dbs(
             self,
             csv_path: str,
@@ -1086,16 +1172,16 @@ class Data:
             updrs_state: str = "on",     # 'off' or 'on'
             replace: bool = False,
             random_state: int | None = None,
-            tsd_caliper_years: float = 2.0,  
+            tsd_caliper_years: float = 2.0,
             logit_caliper_sd: float = np.inf,  # if == -1 -> use iterative selector path
         ) -> Dict[str, pd.DataFrame]:
         """
         Safe non-DBS matching:
         - Propensity uses ONLY pre-treatment covariates (UPDRS_{state}, MoCA_sum_pre if present,
-          and now optionally LEDD_pre + AGE_AT_BASELINE when available).
+          and optionally AGE_AT_BASELINE).
         - Hard caliper on visit-time alignment (± time_tolerance_days).
-        - Logit-propensity caliper (± logit_caliper_sd * SD(logit)); unmatched treated visits are skipped.
-        - Deterministic greedy 1:1 matching (optionally with replacement), or iterative selector when flag set.
+        - Optional logit-propensity caliper (± logit_caliper_sd * SD(logit)).
+        - Deterministic greedy 1:1 matching (or iterative selector when flag set).
         - Returns matched rows + pair diagnostics + SMD balance table + imputation summary.
         """
 
@@ -1167,10 +1253,9 @@ class Data:
         custom_df["TimeSinceBaselineDays"]  = (custom_df["TEST_DATUM"] - first_test).dt.days
         custom_df["TimeSinceBaselineYears"] = custom_df["TimeSinceBaselineDays"] / 365.25
 
-        # ----- Attach/standardize optional covariates on CUSTOM: LEDD_pre and AGE_AT_BASELINE -----
+        # Optional covariates on CUSTOM
         if "LEDD_pre" not in custom_df.columns:
             custom_df["LEDD_pre"] = np.nan
-
         if "AGE_AT_BASELINE" in custom_df.columns:
             custom_df["AGE_AT_BASELINE"] = pd.to_numeric(custom_df["AGE_AT_BASELINE"], errors="coerce")
         else:
@@ -1183,15 +1268,13 @@ class Data:
             else:
                 custom_df["AGE_AT_BASELINE"] = np.nan
 
-        # ---- Guard: only MoCA is supported downstream ----
         if quest.lower() != "moca":
             raise NotImplementedError("Non-DBS matching currently supports quest='moca' only.")
 
         # ---- Load PPMI (DBS=False) and build per-visit frame ----
-        raw = self.load_ppmi()                         # keep the RAW (has Demographics with BIRTHDT)
+        raw = self.load_ppmi()                         # RAW has Demographics with BIRTHDT
         ppmi_cd = self.convert_to_standard_keys(raw, DBS=False)
 
-        # Prepare MoCA+demo and coalesce visit date to TEST_DATUM (INFODT/EXAMDT → TEST_DATUM)
         ppmi_df = self._prepare_moca_with_demo(ppmi_cd)
         if ppmi_df.empty:
             raise ValueError("PPMI MoCA dataset is empty after preprocessing.")
@@ -1210,18 +1293,14 @@ class Data:
         ppmi_df["TimeSinceBaselineDays"]  = (ppmi_df["TEST_DATUM"] - ppmi_first).dt.days
         ppmi_df["TimeSinceBaselineYears"] = ppmi_df["TimeSinceBaselineDays"] / 365.25
 
-        # Compute TimeSinceDiag (fallback to baseline if DIAG_DATE missing, carry-forward per PATNO)
+        # TimeSinceDiag (carry earliest per PATNO if present)
         if "DIAG_DATE" in ppmi_df.columns:
             ppmi_df["TimeSinceDiag"] = ((ppmi_df["TEST_DATUM"] - ppmi_df["DIAG_DATE"]).dt.days / 365.25)
-            by_pat = (ppmi_df
-                      .groupby("PATNO")["TimeSinceDiag"]
-                      .transform(lambda s: s.dropna().min()))
+            by_pat = ppmi_df.groupby("PATNO")["TimeSinceDiag"].transform(lambda s: s.dropna().min())
             ppmi_df["TimeSinceDiag"] = ppmi_df["TimeSinceDiag"].fillna(by_pat)
 
         if "TimeSinceDiagYears" in ppmi_df.columns and "TimeSinceDiag" in ppmi_df.columns:
             ppmi_df.drop(columns=["TimeSinceDiagYears"], inplace=True)
-        self.plot_time_since_diag_hist(ppmi_df, "PPMI (all visits)")
-        self.plot_time_since_diag_hist(custom_df, "Tübingen DBS (all visits)")
 
         # ---- Attach LEDD_pre per visit (nearest prior ± ~2y) ----
         ppmi_df["LEDD_pre"] = self._ledd_nearest_per_visit(
@@ -1233,7 +1312,7 @@ class Data:
         )
 
         # ---- Attach AGE_AT_BASELINE from RAW demographics (BIRTHDT) ----
-        raw_demo = raw.get("demo", pd.DataFrame())  # RAW (from load_ppmi), includes BIRTHDT
+        raw_demo = raw.get("demo", pd.DataFrame())
         if not raw_demo.empty and "BIRTHDT" in raw_demo.columns and "PATNO" in raw_demo.columns:
             raw_demo = safe_parse_dates(raw_demo, cols=["BIRTHDT"], dayfirst=True, report=False)
             base_age = raw_demo[["PATNO", "BIRTHDT"]].dropna()
@@ -1243,19 +1322,17 @@ class Data:
         else:
             ppmi_df["AGE_AT_BASELINE"] = np.nan
 
-        # ---- Attach UPDRS_{state} per visit (EVENT_ID first; fallback by unified TEST_DATUM) ----
+        # ---- Attach UPDRS_{state} per visit ----
         if use_updrs and "mds_updrs" in ppmi_cd:
             up = ppmi_cd["mds_updrs"].get("mds_updrs3")
             if up is not None and not up.empty:
-                # coalesce to TEST_DATUM on the UPDRS table as well
                 up = _coalesce_visit_date(up, out_col="TEST_DATUM",
                                           prefer=("TEST_DATUM", "EXAMDT", "INFODT"))
-                on_tbl = self._get_updrs3_by_state(up, state=state)  # PATNO, TEST_DATUM, [EVENT_ID?], UPDRS_*
+                on_tbl = self._get_updrs3_by_state(up, state=state)
                 on_tbl = _coalesce_visit_date(on_tbl, out_col="TEST_DATUM",
                                               prefer=("TEST_DATUM", "EXAMDT", "INFODT"))
                 on_tbl = safe_parse_dates(on_tbl, cols=["TEST_DATUM"], dayfirst=True, report=False)
 
-                # 1) EVENT_ID exact join (preferred, only if both have it)
                 if "EVENT_ID" in ppmi_df.columns and "EVENT_ID" in on_tbl.columns:
                     ppmi_df = ppmi_df.merge(
                         on_tbl[["PATNO", "EVENT_ID", "TEST_DATUM", updrs_col]],
@@ -1267,13 +1344,13 @@ class Data:
                     if updrs_col not in ppmi_df.columns:
                         ppmi_df[updrs_col] = np.nan
 
-                # 2) Fallback by date proximity for rows still missing UPDRS
+                # Fallback by date proximity
                 need = ppmi_df[ppmi_df[updrs_col].isna()][["PATNO", "TEST_DATUM"]].copy()
                 if not need.empty:
                     tmp = on_tbl.rename(columns={"TEST_DATUM": "UPDRS_TEST_DATUM"})
                     fb = need.merge(tmp[["PATNO", "UPDRS_TEST_DATUM", updrs_col]], on="PATNO", how="left")
                     fb["d"] = (fb["UPDRS_TEST_DATUM"] - fb["TEST_DATUM"]).dt.days
-                    fb = fb.loc[fb["d"].abs() <= 365].copy()  # generous ±1y
+                    fb = fb.loc[fb["d"].abs() <= 365].copy()
                     if not fb.empty:
                         fb["abs_d"] = fb["d"].abs()
                         fb["past_first"] = (fb["d"] > 0).astype(int)
@@ -1294,21 +1371,18 @@ class Data:
         if use_updrs:
             if "UPDRS_on" not in ppmi_df.columns:
                 raise ValueError("UPDRS_on column is missing after attachment – cannot proceed with ON-only matching.")
-
             ppmi_df["has_on"] = ppmi_df["UPDRS_on"].notna()
             on_cov = ppmi_df.groupby("PATNO")["has_on"].mean()
             eligible_patnos = on_cov[on_cov >= 0.50].index
-
             ppmi_df = ppmi_df[ppmi_df["PATNO"].isin(eligible_patnos)].copy()
             ppmi_df = ppmi_df[ppmi_df["has_on"]].copy()
             ppmi_df.drop(columns=["has_on"], inplace=True)
             if "UPDRS_on" in custom_df.columns:
-                custom_df = custom_df[custom_df["UPDRS_on"]].copy() if custom_df["UPDRS_on"].dtype=='bool' else custom_df[custom_df["UPDRS_on"].notna()].copy()
-
+                custom_df = custom_df[custom_df["UPDRS_on"]].copy() if custom_df["UPDRS_on"].dtype == 'bool' else custom_df[custom_df["UPDRS_on"].notna()].copy()
             print(f"[DEBUG] ON-only filter: eligible PPMI patients ≥50% ON: {len(eligible_patnos)} "
                   f"| visits kept: {len(ppmi_df)} | mean ON coverage among eligibles: {on_cov.loc[eligible_patnos].mean():.2%}")
 
-        # ---- Build PPMI baseline→follow-up *pairs* (keeps all valid combos) ----
+        # ---- Build PPMI baseline→follow-up *pairs* ----
         ppmi_df_pairs = self._build_ppmi_timeline_pairs(ppmi_df)   # produces *_pre / *_post, base TEST_DATUM_pre
         ppmi_model = ppmi_df_pairs.copy()
 
@@ -1320,23 +1394,31 @@ class Data:
             how="left"
         )
 
-        # Prefer using the follow-up date for TEST_DATUM (your latest convention), but keep baseline in TEST_DATUM_pre
+        # Prefer using the follow-up date for TEST_DATUM
         ppmi_model = ppmi_model.rename(columns={"TEST_DATUM_post": "TEST_DATUM"})
 
-        # ---- Build propensity inputs (ONLY pre-treatment covariates) ----
-        covars = ["TimeSinceDiag"]    # always present from the baseline side
+        # ---- Create treated design matrix rows (we need this BEFORE any filtering that references it)
+        custom_model = custom_df.dropna(subset=["TimeSinceBaselineDays"]).copy()
+        if custom_model.empty or ppmi_model.empty:
+            raise ValueError("No rows with usable timing in one of the cohorts.")
+
+        # ---- Prefer participants with available MoCA baseline (drop missing MoCA_sum_pre) ----
+        if "MoCA_sum_pre" in custom_model.columns and "MoCA_sum_pre" in ppmi_model.columns:
+            pre_n_custom = len(custom_model)
+            pre_n_ppmi   = len(ppmi_model)
+            custom_model = custom_model.dropna(subset=["MoCA_sum_pre"]).copy()
+            ppmi_model   = ppmi_model.dropna(subset=["MoCA_sum_pre"]).copy()
+            print(f"[PRIORITY] Dropped {pre_n_custom - len(custom_model)} custom and "
+                  f"{pre_n_ppmi - len(ppmi_model)} PPMI rows with missing MoCA_sum_pre before matching.")
+        else:
+            print("[PRIORITY] MoCA_sum_pre not present on one side; skipping MoCA completeness filter.")
+
+        # ---- Covariates (pre-treatment) ----
+        covars = ["TimeSinceDiag"]
         if use_updrs and updrs_col in ppmi_model.columns:
             covars.append(updrs_col)
-
-        # Baseline MoCA (if present)
-        moca_covars = [
-            "MoCA_sum_pre",
-            "MoCA_Erinnerung_sum_pre",
-            "MoCA_Executive_sum_pre",
-        ]
+        moca_covars = ["MoCA_sum_pre", "MoCA_Erinnerung_sum_pre", "MoCA_Executive_sum_pre"]
         covars.extend([c for c in moca_covars if c in ppmi_model.columns])
-
-        # New optional covariates (add if present)
         if "AGE_AT_BASELINE" in ppmi_model.columns:
             covars.append("AGE_AT_BASELINE")
 
@@ -1345,45 +1427,11 @@ class Data:
             if c not in custom_df.columns:
                 custom_df[c] = np.nan
 
-        # Drop to rows having time (we'll impute covariates inside the pipeline)
-        custom_model = custom_df.dropna(subset=["TimeSinceBaselineDays"]).copy()
+        # ---- STRICT: require TimeSinceDiag on both sides (no imputation) ----
+        custom_model = custom_model.dropna(subset=["TimeSinceDiag"]).copy()
+        ppmi_model   = ppmi_model.dropna(subset=["TimeSinceDiag"]).copy()
         if custom_model.empty or ppmi_model.empty:
-            raise ValueError("No rows with usable timing in one of the cohorts.")
-
-        # ----- Enforce "max 5% imputed" rule for TimeSinceDiag -----  ✅ moved here
-        max_impute_frac = 0.05
-
-        def _drop_missing_tsd(df, who):
-            n0 = len(df)
-            df = df.dropna(subset=["TimeSinceDiag"]).copy()
-            print(f"[RULE] Dropped {n0 - len(df)} rows with missing TimeSinceDiag from {who}.")
-            return df
-
-        if "TimeSinceDiag" not in custom_model.columns or "TimeSinceDiag" not in ppmi_model.columns:
-            raise ValueError("TimeSinceDiag must exist in both cohorts before matching.")
-
-        total_n = len(custom_model) + len(ppmi_model)
-        missing_total = custom_model["TimeSinceDiag"].isna().sum() + ppmi_model["TimeSinceDiag"].isna().sum()
-        missing_frac = missing_total / max(total_n, 1)
-
-        print(f"[QC] TimeSinceDiag missing overall: {missing_total}/{total_n} ({missing_frac:.2%})")
-
-        if missing_frac > max_impute_frac:
-            # Prefer to keep treated; drop missing in controls first
-            if ppmi_model["TimeSinceDiag"].isna().any():
-                ppmi_model = _drop_missing_tsd(ppmi_model, "PPMI")
-            # Recompute; if still >5%, drop on treated side too
-            total_n = len(custom_model) + len(ppmi_model)
-            missing_total = custom_model["TimeSinceDiag"].isna().sum() + ppmi_model["TimeSinceDiag"].isna().sum()
-            missing_frac = missing_total / max(total_n, 1)
-            if missing_frac > max_impute_frac and custom_model["TimeSinceDiag"].isna().any():
-                custom_model = _drop_missing_tsd(custom_model, "Custom")
-            print(f"[QC] After drops, TSD missing: "
-                  f"{custom_model['TimeSinceDiag'].isna().sum() + ppmi_model['TimeSinceDiag'].isna().sum()}"
-                  f"/{len(custom_model)+len(ppmi_model)} "
-                  f"({(custom_model['TimeSinceDiag'].isna().sum() + ppmi_model['TimeSinceDiag'].isna().sum())/max(1,len(custom_model)+len(ppmi_model)):.2%})")
-        else:
-            print("[RULE] TSD missing ≤ 5%: will allow median imputation for TSD.")
+            raise ValueError("After enforcing non-missing TimeSinceDiag, one cohort is empty.")
 
         # ---- Propensity pipeline: impute (median) -> scale -> logit (fit ONCE globally)
         from sklearn.pipeline import Pipeline
@@ -1400,11 +1448,11 @@ class Data:
                 ]), covars)
             ], remainder="drop", verbose_feature_names_out=False)),
             ("logit", LogisticRegression(
-                solver="liblinear", 
-                C=1.0, 
+                solver="liblinear",
+                C=1.0,
                 max_iter=2000,
                 class_weight="balanced"
-                ))
+            ))
         ])
 
         # Design matrices BEFORE fitting
@@ -1416,7 +1464,7 @@ class Data:
 
         print("[match_non_dbs] Matching covariates used in propensity model:")
         for c in covars:
-            n_custom = custom_df[c].notna().sum()
+            n_custom = custom_model[c].notna().sum()
             n_ppmi = ppmi_model[c].notna().sum()
             print(f"  {c:30s} | custom: {n_custom:4d} non-NA | ppmi: {n_ppmi:4d} non-NA")
 
@@ -1488,16 +1536,19 @@ class Data:
             if "__orig_ix" not in ppmi_model.columns:
                 ppmi_model["__orig_ix"] = ppmi_model.index
 
-            treated_matches, control_matches, pair_df = iterative_propensity_matching(
+            treated_matches, control_matches, pair_df = self.iterative_propensity_matching(
                 custom_model=custom_model,
                 ppmi_model=ppmi_model,
                 time_tolerance_days=time_tolerance_days,
-                caliper_logit=sd_logit * 0.2 if np.isfinite(sd_logit) and sd_logit > 0 else np.inf,  # default 0.2*SD
+                caliper_logit=sd_logit * 0.2 if np.isfinite(sd_logit) and sd_logit > 0 else np.inf,
                 replace=replace,
                 batch_size=500,
                 random_state=42,
             )
-
+            treated_matches["matched_ppmi_patno"]  = control_matches["PATNO"].values
+            treated_matches["matched_ppmi_index"]  = pair_df["ppmi_orig_index"].values
+            control_matches["matched_custom_index"] = pair_df["custom_index"].values
+            control_matches["matched_custom_id"]    = treated_matches[id_column].values
             treated_matches = self._rename_moca_pre_post(treated_matches)
             control_matches = self._rename_moca_pre_post(control_matches)
             treated_matches = _standardize_moca_suffixes(treated_matches)
@@ -1531,12 +1582,14 @@ class Data:
             cand = pool[(pool["TimeSinceBaselineDays"] - row["TimeSinceBaselineDays"]).abs() <= float(time_tolerance_days)].copy()
             if cand.empty:
                 continue
-            
-            if "TimeSinceDiag" in cand.columns and "TimeSinceDiag" in row:
-                cand = cand[(cand["TimeSinceDiag"] - row["TimeSinceDiag"]).abs()
-                            <= (tsd_caliper_years)]
 
-            # 2) logit caliper (hard)
+            # 2) optional TSD proximity caliper
+            if "TimeSinceDiag" in cand.columns and "TimeSinceDiag" in row:
+                cand = cand[(cand["TimeSinceDiag"] - row["TimeSinceDiag"]).abs() <= tsd_caliper_years]
+                if cand.empty:
+                    continue
+
+            # 3) logit caliper (hard)
             cand = cand[(cand["logit"] - row["logit"]).abs() <= caliper].copy()
             if cand.empty:
                 continue
@@ -1557,7 +1610,8 @@ class Data:
             else:
                 cand["updrs_diff"] = np.inf
 
-            cand = cand.sort_values(["prop_diff", "time_diff", "diag_diff", "updrs_diff", "PATNO", "TEST_DATUM"])
+            cand["age_diff"] = np.abs(cand["AGE_AT_BASELINE"] - row["AGE_AT_BASELINE"])
+            cand = cand.sort_values(["prop_diff", "diag_diff","age_diff", "time_diff", "updrs_diff",  "PATNO", "TEST_DATUM"])
             pi = int(cand.index[0])
             pr = cand.loc[pi]
 
@@ -1645,8 +1699,6 @@ class Data:
             "balance": smd_table,
             "imputation_summary": imputations_summary,
         }
-
-
 
 
 
@@ -1855,14 +1907,14 @@ class Data:
 
     # ---------- Optional: example main ----------
 if __name__ == "__main__":
-    path_ppmi = '/home/georg-tirpitz/Documents/Neuromodulation/Parkinson_PSM/PPMI'
-    csv_path_ledd  = "/home/georg-tirpitz/Documents/PD-MultiModal-Prediction/data/MoCA/level2/moca_ledd.csv"
-    csv_path_updrs     = "/home/georg-tirpitz/Documents/PD-MultiModal-Prediction/data/MoCA/level2/moca_updrs_joined.csv"
-    std_map   = '/home/georg-tirpitz/Documents/PD-PropensityMatching/covariate_names.csv'
-    #path_ppmi =  "/home/georg/Documents/Neuromodulation/PPMI"
-    #csv_path_ledd  = "/home/georg/Documents/Neuromodulation/PD-MultiModal-Prediction/data/MoCA/level2/moca_ledd.csv"
-    #csv_path_updrs     = "/home/georg/Documents/Neuromodulation/PD-MultiModal-Prediction/data/MoCA/level2/moca_updrs.csv"
-    #std_map   = "covariate_names.csv"
+    #path_ppmi = '/home/georg-tirpitz/Documents/Neuromodulation/Parkinson_PSM/PPMI'
+    #csv_path_ledd  = "/home/georg-tirpitz/Documents/PD-MultiModal-Prediction/data/MoCA/level2/moca_ledd.csv"
+    #csv_path_updrs     = "/home/georg-tirpitz/Documents/PD-MultiModal-Prediction/data/MoCA/level2/moca_updrs_joined.csv"
+    #std_map   = '/home/georg-tirpitz/Documents/PD-PropensityMatching/covariate_names.csv'
+    path_ppmi =  "/home/georg/Documents/Neuromodulation/PPMI"
+    csv_path_ledd  = "/home/georg/Documents/Neuromodulation/PD-MultiModal-Prediction/data/MoCA/level2/moca_ledd.csv"
+    csv_path_updrs     = "/home/georg/Documents/Neuromodulation/PD-MultiModal-Prediction/data/MoCA/level2/moca_updrs_joined.csv"
+    std_map   = "covariate_names.csv"
     ppmi_data = Data(path_ppmi, foldertype="PPMI", covariate_names=std_map)
 
     # DBS
@@ -1879,7 +1931,8 @@ if __name__ == "__main__":
         csv_path_updrs,
         quest="moca",
         id_column="PATNO",
-        time_tolerance_days=120,
+        time_tolerance_days=90,
+        logit_caliper_sd=-1,
         use_updrs=True,
         replace=False,
         random_state=42
@@ -1908,7 +1961,7 @@ if __name__ == "__main__":
 
     moca_subscores = [f"{col}_sum_pre" for col in ppmi_data.MOCA_CATEGORY_MAP]
 
-    for col in moca_subscores + ["UPDRS_on", "TimeSinceDiag",]:
+    for col in moca_subscores + ["UPDRS_on", "TimeSinceDiag", "AGE_AT_BASELINE"]:
         plt.figure()
         plt.hist(medication_group["custom"][col], alpha=0.6, label="Custom", bins=15)
         plt.hist(medication_group["ppmi"][col], alpha=0.6, label="PPMI", bins=15)
