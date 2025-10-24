@@ -45,6 +45,7 @@ COVARIATE_LABELS = {
     "MoCA_sum_pre": "MoCA Total Baseline",
     "AGE_AT_OP": "Age at Operation",
     "AGE_AT_BASELINE": "Age at Baseline",
+    # label for MoCA post will be inserted dynamically if present
 }
 
 import numpy as np
@@ -71,7 +72,7 @@ def _prep_moca_pairs(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for c in cols:
         out[c] = pd.to_numeric(out[c], errors="coerce")
-        # ✅ median impute MoCA
+        # median impute MoCA
         if out[c].isna().any():
             out[c] = out[c].fillna(out[c].median())
     # after impute, no row should be dropped for MoCA
@@ -86,7 +87,7 @@ def _half_violin(ax, x_pos: float, values: np.ndarray, side: str, color: str, wi
         inner=None,
         cut=0,
         linewidth=0,
-        color=mcolors.to_rgba(color, alpha=0.75),  # ✅ darker overall body
+        color=mcolors.to_rgba(color, alpha=0.75),  # darker overall body
         width=width,
         ax=ax,
     )
@@ -94,7 +95,7 @@ def _half_violin(ax, x_pos: float, values: np.ndarray, side: str, color: str, wi
     for collection in ax.collections[-1:]:
         if not isinstance(collection, PolyCollection):
             continue
-        fc = mcolors.to_rgba(color, alpha=0.75)   # ✅ darker fill
+        fc = mcolors.to_rgba(color, alpha=0.75)   # darker fill
         ec = mcolors.to_rgba(color, alpha=1.0)
         collection.set_facecolor(fc)
         collection.set_edgecolor(ec)
@@ -172,13 +173,13 @@ def _raincloud_ax_for_moca(ax, data: pd.DataFrame, title: str):
     ax.set_title(f"{title} (N = {n})", fontsize=14, loc="left", pad=10)
     ax.set_xlim(0.5, 2.5)
 
-    # ✅ Dynamic limits with ~10% padding on both ends (allow slight >30 to make space)
+    # Dynamic limits with padding (≈10% bottom, ≈20% top so legend never overlaps)
     y_min = float(np.nanmin([pre.min(), post.min()]))
     y_max = float(np.nanmax([pre.max(), post.max()]))
     span = y_max - y_min if y_max != y_min else 1.0
-    lower_pad = 0.05 * span
-    upper_pad = 0.10 * span
-    ax.set_ylim(max(0, y_min - lower_pad), y_max + upper_pad)  # clamp lower at 0, allow a bit above 30
+    pad_bottom = 0.10 * span
+    pad_top = 0.20 * span  # extra space for legend
+    ax.set_ylim(max(0, y_min - pad_bottom), y_max + pad_top)  # clamp lower at 0, allow >30 above
 
     ax.yaxis.set_minor_locator(AutoMinorLocator())
     sns.despine(ax=ax)
@@ -190,6 +191,7 @@ def raincloud_moca_side_by_side(groups: MatchedGroups, output_path: Path, show: 
       Left  : Tübingen DBS  (MoCA_sum_pre vs MoCA_sum_post)
       Right : PPMI matched  (MoCA_sum_pre vs MoCA_sum_post)
     Saves PNG and SVG to `output_path` (stem used for both).
+    Also writes a text field below with the mean absolute Pre–Post distance for both groups.
     """
     # Align by matched index and keep pairs with both measurements (after impute, all kept)
     left  = _prep_moca_pairs(groups.custom)
@@ -207,7 +209,27 @@ def raincloud_moca_side_by_side(groups: MatchedGroups, output_path: Path, show: 
     ]
     axes[0].legend(handles=legend_elems, loc="lower left", frameon=False)
 
-    plt.tight_layout()
+    # --- Avg absolute distance between Pre and Post (per group) ---
+    left_dist  = float(np.mean(np.abs(left["MoCA_sum_post"] - left["MoCA_sum_pre"])))
+    right_dist = float(np.mean(np.abs(right["MoCA_sum_post"] - right["MoCA_sum_pre"])))
+
+    # place two small text fields centered under each subplot
+    fig.text(
+        0.25, 0.02,
+        f"Mean |Post − Pre| (DBS): {left_dist:.2f}",
+        ha="center", va="center",
+        fontsize=11,
+        bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", boxstyle="round,pad=0.25")
+    )
+    fig.text(
+        0.75, 0.02,
+        f"Mean |Post − Pre| (PPMI): {right_dist:.2f}",
+        ha="center", va="center",
+        fontsize=11,
+        bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", boxstyle="round,pad=0.25")
+    )
+
+    plt.tight_layout(rect=(0, 0.05, 1, 1))  # leave room at bottom for text
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path.with_suffix(".png"), dpi=300, bbox_inches="tight")
@@ -256,16 +278,23 @@ def load_groups(custom_path: Path, ppmi_path: Path) -> MatchedGroups:
     return MatchedGroups(custom=custom_matched, ppmi=ppmi_matched)
 
 
-def plot_moca_radar(groups: MatchedGroups, output_path: Path) -> None:
+def plot_moca_radar(
+    groups: MatchedGroups,
+    output_stem: Path,
+    score_suffix: str,
+    title: str,
+) -> None:
     # Only include MoCA subscores, not the total
     moca_cols = sorted(
         col
         for col in groups.custom.columns
-        if col.startswith("MoCA_") and col.endswith("_sum_post") and col != "MoCA_sum_post"
+        if col.startswith("MoCA_")
+        and col.endswith(score_suffix)
+        and col != f"MoCA{score_suffix}"
     )
     moca_cols = [col for col in moca_cols if col in groups.ppmi.columns]
     if not moca_cols:
-        raise ValueError("No MoCA *_sum_post subscore columns found for radar plot.")
+        raise ValueError(f"No MoCA columns ending with '{score_suffix}' found for radar plot.")
 
     custom_means = groups.custom[moca_cols].mean(numeric_only=True)
     ppmi_means = groups.ppmi[moca_cols].mean(numeric_only=True)
@@ -290,23 +319,23 @@ def plot_moca_radar(groups: MatchedGroups, output_path: Path) -> None:
 
     # Axis labels
     ax.set_xticks(angles[:-1])
-    ax.set_xticklabels([col.replace("MoCA_", "").replace("_sum_post", "") for col in moca_cols])
+    axis_labels = []
+    for col in moca_cols:
+        label = col.replace("MoCA_", "").replace(score_suffix, "")
+        axis_labels.append(label)
+    ax.set_xticklabels(axis_labels)
     ax.set_ylim(0, radial_max)
 
-    # ✅ FIX: clear, properly spaced title (no overlapping)
-    ax.set_title(
-        "MoCA Postoperative Subscores (Radar)",
-        pad=25,  # move up
-        y=1.08,  # extra vertical space above plot area
-        fontsize=14,
-        weight="bold"
-    )
+    # clear, properly spaced title (no overlapping)
+    ax.set_title(title, pad=25, y=1.08, fontsize=14, weight="bold")
 
     # Legend placement
     ax.legend(loc="upper right", bbox_to_anchor=(1.2, 1.1))
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    output_stem = Path(output_stem)
+    output_stem.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_stem.with_suffix(".png"), dpi=300, bbox_inches="tight")
+    fig.savefig(output_stem.with_suffix(".svg"), dpi=300, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -388,7 +417,7 @@ def ttest_plots(
         x = pd.to_numeric(groups.custom[var], errors="coerce")
         y = pd.to_numeric(groups.ppmi[var], errors="coerce")
 
-        # ✅ median-impute for MoCA variables only (keeps other plots unchanged)
+        # median-impute for MoCA variables only (keeps other plots unchanged)
         if "MoCA" in var:
             if x.isna().any():
                 x = x.fillna(x.median())
@@ -474,16 +503,15 @@ def ttest_plots(
 
         # Text box contents
         if is_moca:
+            # Only show Mann–Whitney and Paired t-test
             text_lines = [
-                #f"Welch p = {welch['p_value']:.3g}" if pd.notna(welch["p_value"]) else "Welch p = n/a",
-                f"Paired t-test p = {paired['p_value']:.3g}" if pd.notna(paired["p_value"]) else "Paired t-test p = n/a",
                 f"Mann–Whitney p = {mw_p:.3g}" if pd.notna(mw_p) else "Mann–Whitney p = n/a",
-                #f"Wilcoxon p = {wil_p:.3g}" if pd.notna(wil_p) else "Wilcoxon p = n/a",
+                f"Paired t-test p = {paired['p_value']:.3g}" if pd.notna(paired["p_value"]) else "Paired t-test p = n/a",
             ]
         else:
             text_lines = [
                 f"Welch p = {welch['p_value']:.3g}" if pd.notna(welch["p_value"]) else "Welch p = n/a",
-                f"Paired t-test p = {paired['p_value']:.3g}" if pd.notna(paired["p_value"]) else "Paired t-test p = n/a",
+                f"Paired t-test p = {paired['p_value']:.3g}" if pd.notna(paired['p_value']) else "Paired t-test p = n/a",
             ]
 
         ax.text(
@@ -497,7 +525,6 @@ def ttest_plots(
             zorder=10,  # ensures it's on top of gridlines and boxplot
         )
 
-
         sns.despine(ax=ax)
         output_dir.mkdir(parents=True, exist_ok=True)
         fig.savefig(output_dir / f"{var}_ttest.png", dpi=300, bbox_inches="tight")
@@ -510,17 +537,36 @@ def ttest_plots(
 
 def run_analysis(custom_path: Path, ppmi_path: Path, output_dir: Path) -> None:
     groups = load_groups(custom_path, ppmi_path)
-    radar_path = output_dir / "moca_sum_post_radar.png"
-    plot_moca_radar(groups, radar_path)
-    print(f"Saved MoCA radar plot to {radar_path}")
 
+    # Radar plots for MoCA subscores (pre and post)
+    radar_dir = output_dir / "radar_plots"
+    plot_moca_radar(
+        groups,
+        radar_dir / "moca_sum_pre_radar",
+        score_suffix="_sum_pre",
+        title="MoCA Baseline Subscores (Radar)",
+    )
+    plot_moca_radar(
+        groups,
+        radar_dir / "moca_sum_post_radar",
+        score_suffix="_sum_post",
+        title="MoCA Postoperative Subscores (Radar)",
+    )
+    print(f"Saved MoCA radar plots to {radar_dir}")
+
+    # Variables for t-tests (add MoCA post if present; support the 'um' typo too)
     variables = ["AGE_AT_OP", "AGE_AT_BASELINE", "TimeSinceDiag", "UPDRS_on", "MoCA_sum_pre"]
+    for candidate in ("MoCA_sum_post", "MoCA_um_post"):
+        if candidate in groups.custom.columns and candidate in groups.ppmi.columns:
+            variables.append(candidate)
+            COVARIATE_LABELS[candidate] = "MoCA Total Postoperative"
+
     results_df = ttest_plots(groups, variables, output_dir / "ttest_plots")
     results_path = output_dir / "ttest_summary.csv"
     results_df.to_csv(results_path, index=False)
     print(f"Wrote t-test summary to {results_path}")
 
-    # Side-by-side MoCA raincloud (now with median impute + darker violins + 10% padding)
+    # Side-by-side MoCA raincloud (median impute + darker violins + extra top padding + avg distance text)
     raincloud_moca_side_by_side(groups, output_dir / "moca_raincloud")
     print(f"Saved MoCA raincloud plots to {output_dir}/moca_raincloud.png and .svg")
 
