@@ -190,8 +190,8 @@ def raincloud_moca_side_by_side(groups: MatchedGroups, output_path: Path, show: 
     Build a 1x2 figure:
       Left  : Tübingen DBS  (MoCA_sum_pre vs MoCA_sum_post)
       Right : PPMI matched  (MoCA_sum_pre vs MoCA_sum_post)
-    Saves PNG and SVG to `output_path` (stem used for both).
-    Also writes a text field below with the mean absolute Pre–Post distance for both groups.
+    Saves svg and SVG to `output_path` (stem used for both).
+    Also writes a text field below with the mean (Pre − Post) difference and standard deviation for both groups.
     """
     # Align by matched index and keep pairs with both measurements (after impute, all kept)
     left  = _prep_moca_pairs(groups.custom)
@@ -209,21 +209,23 @@ def raincloud_moca_side_by_side(groups: MatchedGroups, output_path: Path, show: 
     ]
     axes[0].legend(handles=legend_elems, loc="lower left", frameon=False)
 
-    # --- Avg absolute distance between Pre and Post (per group) ---
-    left_dist  = float(np.mean(np.abs(left["MoCA_sum_post"] - left["MoCA_sum_pre"])))
-    right_dist = float(np.mean(np.abs(right["MoCA_sum_post"] - right["MoCA_sum_pre"])))
+    # --- Mean (Pre − Post) difference and SD (per group) ---
+    left_diff = left["MoCA_sum_pre"] - left["MoCA_sum_post"]
+    right_diff = right["MoCA_sum_pre"] - right["MoCA_sum_post"]
+    left_mean, left_std = float(left_diff.mean()), float(left_diff.std(ddof=1))
+    right_mean, right_std = float(right_diff.mean()), float(right_diff.std(ddof=1))
 
     # place two small text fields centered under each subplot
     fig.text(
         0.25, 0.02,
-        f"Mean |Post − Pre| (DBS): {left_dist:.2f}",
+        f"Pre − Post (DBS): mean {left_mean:.2f}, SD {left_std:.2f}",
         ha="center", va="center",
         fontsize=11,
         bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", boxstyle="round,pad=0.25")
     )
     fig.text(
         0.75, 0.02,
-        f"Mean |Post − Pre| (PPMI): {right_dist:.2f}",
+        f"Pre − Post (PPMI): mean {right_mean:.2f}, SD {right_std:.2f}",
         ha="center", va="center",
         fontsize=11,
         bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", boxstyle="round,pad=0.25")
@@ -378,7 +380,7 @@ def plot_moca_radar(
 
     output_stem = Path(output_stem)
     output_stem.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_stem.with_suffix(".png"), dpi=300, bbox_inches="tight")
+    fig.savefig(output_stem.with_suffix(".svg"), dpi=300, bbox_inches="tight")
     fig.savefig(output_stem.with_suffix(".svg"), dpi=300, bbox_inches="tight")
     plt.close(fig)
 
@@ -574,7 +576,7 @@ def ttest_plots(
 
         sns.despine(ax=ax)
         output_dir.mkdir(parents=True, exist_ok=True)
-        fig.savefig(output_dir / f"{var}_ttest.png", dpi=300, bbox_inches="tight")
+        fig.savefig(output_dir / f"{var}_ttest.svg", dpi=300, bbox_inches="tight")
         plt.close(fig)
 
     return pd.DataFrame(results)
@@ -615,7 +617,7 @@ def run_analysis(custom_path: Path, ppmi_path: Path, output_dir: Path) -> None:
 
     # Side-by-side MoCA raincloud (median impute + darker violins + extra top padding + avg distance text)
     raincloud_moca_side_by_side(groups, output_dir / "moca_raincloud")
-    print(f"Saved MoCA raincloud plots to {output_dir}/moca_raincloud.png and .svg")
+    print(f"Saved MoCA raincloud plots to {output_dir}/moca_raincloud.svg and .svg")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
