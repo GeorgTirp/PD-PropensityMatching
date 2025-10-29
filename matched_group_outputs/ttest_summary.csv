@@ -1,6 +1,0 @@
-variable,label,n_custom,n_ppmi,n_pairs_paired,welch_p,paired_p,significance_welch,significance_paired,mannwhitney_p,wilcoxon_p
-AGE_AT_BASELINE,Age at Baseline,63,63,63,0.9476633470886076,0.677877376878913,n.s.,n.s.,,
-TimeSinceDiag,Time Since Diagnosis,63,63,63,0.8596362045546265,0.4213505448045929,n.s.,n.s.,,
-UPDRS_on,UPDRS On Med,63,63,63,0.9852424981529627,0.9818907693167301,n.s.,n.s.,,
-MoCA_sum_pre,MoCA Total Baseline,63,63,63,0.9666130392600938,0.9474809380727063,n.s.,n.s.,0.7119689669599985,0.7124487291349857
-MoCA_sum_post,MoCA Total Postoperative,63,63,63,0.37832098080827314,0.3538476049786362,n.s.,n.s.,0.4163128558391348,0.42227508696272686

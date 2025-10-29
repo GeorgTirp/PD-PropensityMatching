@@ -407,27 +407,7 @@ class Data:
 
         return result
     
-    def _coalesce_into(df: pd.DataFrame, target: str, candidates: list[str]) -> pd.DataFrame:
-        """
-        If `target` is missing or entirely NaN, copy the first existing candidate column into `target`.
-        Case-insensitive column matching. Tries numeric coerce; falls back to raw if non-numeric.
-        """
-        # Already present and not all-NaN → keep it
-        if target in df.columns and not df[target].isna().all():
-            return df
 
-        lower_map = {c.lower(): c for c in df.columns}
-        for cand in candidates:
-            src = lower_map.get(cand.lower())
-            if src:
-                try:
-                    df[target] = pd.to_numeric(df[src], errors="coerce")
-                    if df[target].isna().all():  # e.g., non-numeric strings
-                        df[target] = df[src]
-                except Exception:
-                    df[target] = df[src]
-                break
-        return df
 
     @staticmethod
     def _compute_ledd_pre(
@@ -539,7 +519,7 @@ class Data:
     def _prepare_moca_with_demo(self, complete_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         moca_df = complete_data.get("moca")
         if moca_df is None:
-            return pd.DataFrame()
+            return pd.DataFrame()   
         moca_df = self._augment_moca_scores(moca_df)
         demo_df = complete_data.get("demo")
         if demo_df is None:
@@ -826,36 +806,35 @@ class Data:
     ) -> pd.DataFrame:
         """
         Ensure a visit-level date column exists by copying the first usable candidate
-        from `prefer` into `out_col`. Returns a copy so callers can chain safely.
+        from `prefer` into `out_col`. Avoids noisy dateutil fallbacks by:
+          - no-op if the source column is already datetime64,
+          - otherwise delegating to safe_parse_dates (which normalizes first),
+          - using format='mixed' where available (inside safe_parse_dates).
         """
         tmp = df.copy()
         for col in prefer:
-            if col in tmp.columns and tmp[col].notna().any():
-                parsed = pd.to_datetime(tmp[col], errors="coerce", dayfirst=dayfirst)
-                if parsed.notna().any():
-                    tmp[out_col] = parsed
-                    break
+            if col not in tmp.columns or tmp[col].isna().all():
+                continue
+
+            s = tmp[col]
+            # If already datetime, just reuse it
+            if pd.api.types.is_datetime64_any_dtype(s):
+                tmp[out_col] = s
+                break
+
+            # Else parse robustly via safe_parse_dates on a tiny frame
+            parsed = safe_parse_dates(
+                pd.DataFrame({col: s}),
+                cols=[col],
+                dayfirst=dayfirst,
+                report=False
+            )[col]
+            if parsed.notna().any():
+                tmp[out_col] = parsed
+                break
+
         return tmp
 
-    @staticmethod
-    def _standardize_moca_suffixes(df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Normalize MoCA sub-score suffixes to *_sum_pre/_sum_post so downstream code
-        can rely on consistent column names.
-        """
-        renamed = df.copy()
-        rename_map: Dict[str, str] = {}
-        for col in renamed.columns:
-            if col.startswith("MoCA_"):
-                if col.endswith("_sum_pre") or col.endswith("_sum_post"):
-                    continue
-                if col.endswith("_pre") and not col.endswith("_sum_pre"):
-                    rename_map[col] = col.replace("_pre", "_sum_pre")
-                elif col.endswith("_post") and not col.endswith("_sum_post"):
-                    rename_map[col] = col.replace("_post", "_sum_post")
-        if rename_map:
-            renamed = renamed.rename(columns=rename_map)
-        return renamed
 
     @staticmethod
     def _non_dbs_keep_columns(
@@ -924,24 +903,16 @@ class Data:
 
         # --- Build ON/OFF masks
         def _state_mask(df: pd.DataFrame, state: str) -> pd.Series:
-            # default all False
             mask = pd.Series(False, index=df.index)
 
             if "PDSTATE" in df.columns:
                 ps_num = pd.to_numeric(df["PDSTATE"], errors="coerce")
                 if ps_num.notna().any():
-                    if state == "off":
-                        mask = ps_num == 0
-                    else:
-                        mask = ps_num > 0
+                    mask = (ps_num == 0) if state == "off" else (ps_num > 0)
                 else:
                     ps = df["PDSTATE"].astype(str).str.upper()
-                    if state == "off":
-                        mask = ps.str.contains(r"\bOFF\b", na=False)
-                    else:
-                        mask = ps.str.contains(r"\bON\b", na=False)
+                    mask = ps.str.contains(r"\bOFF\b", na=False) if state == "off" else ps.str.contains(r"\bON\b", na=False)
 
-            # fallbacks (only where mask not already True)
             if "OFFEXAM" in df.columns and state == "off":
                 mask = mask | (df["OFFEXAM"] == 1)
             if "ONEXAM" in df.columns and state == "on":
@@ -952,46 +923,45 @@ class Data:
         mask_on  = _state_mask(up3, "on")
         mask_off = _state_mask(up3, "off")
 
-        on_tbl = up3.loc[mask_on,  ["PATNO", "TEST_DATUM", tot]].rename(columns={tot: "UPDRS_on"}).copy()
+        on_tbl  = up3.loc[mask_on,  ["PATNO", "TEST_DATUM", tot]].rename(columns={tot: "UPDRS_on"}).copy()
         off_tbl = up3.loc[mask_off, ["PATNO", "TEST_DATUM", tot]].rename(columns={tot: "UPDRS_off"}).copy()
 
-        # --- Step 1: keep your current ON logic (EVENT_ID join if present, else nearest).
-        # If you already did this earlier, you can skip redoing; otherwise:
-        # Try exact merge by (PATNO, EVENT_ID) when both sides have it
+        # --- Step 1: attach ON (EVENT_ID exact merge if possible, then nearest within window)
         if "EVENT_ID" in ppmi_visits.columns and "EVENT_ID" in up3.columns:
             on_ev = up3.loc[mask_on, ["PATNO", "EVENT_ID", tot]].rename(columns={tot: "UPDRS_on"})
             ppmi_visits = ppmi_visits.merge(on_ev, on=["PATNO", "EVENT_ID"], how="left")
 
-        # Fill remaining ON via nearest-in-time (±nearest_window_days, prefer past)
         need_on = ppmi_visits["UPDRS_on"].isna() if "UPDRS_on" in ppmi_visits.columns else pd.Series(True, index=ppmi_visits.index)
         if need_on.any():
             anchor = ppmi_visits.loc[need_on, ["PATNO", "TEST_DATUM"]].copy()
             anchor = safe_parse_dates(anchor, cols=["TEST_DATUM"], dayfirst=True, report=False).dropna(subset=["TEST_DATUM"])
-            if not anchor.empty:
+            if not anchor.empty and not on_tbl.empty:
                 tmp = anchor.merge(on_tbl.rename(columns={"TEST_DATUM": "ON_TEST_DATUM"}), on="PATNO", how="left")
                 if not tmp.empty:
                     tmp["d"] = (tmp["ON_TEST_DATUM"] - tmp["TEST_DATUM"]).dt.days
                     tmp = tmp[tmp["d"].abs() <= int(nearest_window_days)]
                     if not tmp.empty:
                         tmp["abs_d"] = tmp["d"].abs()
-                        # prefer past if requested
                         if prefer_past:
-                            tmp["past_first"] = (tmp["d"] > 0).astype(int)  # 0 (past) sorts before 1 (future)
+                            tmp["past_first"] = (tmp["d"] > 0).astype(int)  # 0 (past) before 1 (future)
                             tmp = (tmp.sort_values(["PATNO","TEST_DATUM","abs_d","past_first"])
                                       .drop_duplicates(subset=["PATNO","TEST_DATUM"], keep="first"))
                         else:
                             tmp = (tmp.sort_values(["PATNO","TEST_DATUM","abs_d"])
                                       .drop_duplicates(subset=["PATNO","TEST_DATUM"], keep="first"))
-                        tmp = tmp[["PATNO","TEST_DATUM","UPDRS_on"]]
-                        ppmi_visits = ppmi_visits.merge(tmp, on=["PATNO","TEST_DATUM"], how="left", suffixes=("", "_NEARON"))
-                        # coalesce
-                        if "UPDRS_on" not in ppmi_visits.columns:
-                            ppmi_visits["UPDRS_on"] = ppmi_visits["UPDRS_on_NEARON"]
-                        else:
+                        tmp = tmp.rename(columns={"UPDRS_on": "UPDRS_on_NEARON"})
+                        ppmi_visits = ppmi_visits.merge(
+                            tmp[["PATNO","TEST_DATUM","UPDRS_on_NEARON"]],
+                            on=["PATNO","TEST_DATUM"], how="left"
+                        )
+                        # Safe coalesce & cleanup
+                        if "UPDRS_on_NEARON" in ppmi_visits.columns:
+                            if "UPDRS_on" not in ppmi_visits.columns:
+                                ppmi_visits["UPDRS_on"] = np.nan
                             ppmi_visits["UPDRS_on"] = ppmi_visits["UPDRS_on"].combine_first(ppmi_visits["UPDRS_on_NEARON"])
-                        ppmi_visits.drop(columns=[c for c in ppmi_visits.columns if c.endswith("_NEARON")], inplace=True, errors="ignore")
+                            ppmi_visits.drop(columns=["UPDRS_on_NEARON"], inplace=True, errors="ignore")
 
-        # --- Step 2: for each ON visit, attach nearest OFF (±nearest_window_days)
+        # --- Step 2: for ON visits, attach nearest OFF within window
         have_on = ppmi_visits["UPDRS_on"].notna() if "UPDRS_on" in ppmi_visits.columns else pd.Series(False, index=ppmi_visits.index)
         anchor = ppmi_visits.loc[have_on, ["PATNO", "TEST_DATUM"]].copy()
         anchor = safe_parse_dates(anchor, cols=["TEST_DATUM"], dayfirst=True, report=False).dropna(subset=["TEST_DATUM"])
@@ -1009,16 +979,20 @@ class Data:
                     else:
                         tmp = (tmp.sort_values(["PATNO","TEST_DATUM","abs_d"])
                                   .drop_duplicates(subset=["PATNO","TEST_DATUM"], keep="first"))
-                    tmp = tmp[["PATNO","TEST_DATUM","UPDRS_off"]]
-                    ppmi_visits = ppmi_visits.merge(tmp, on=["PATNO","TEST_DATUM"], how="left", suffixes=("", "_NEAROFF"))
-                    # coalesce into UPDRS_off (create if missing)
-                    if "UPDRS_off" not in ppmi_visits.columns:
-                        ppmi_visits["UPDRS_off"] = ppmi_visits["UPDRS_off_NEAROFF"]
-                    else:
+                    tmp = tmp.rename(columns={"UPDRS_off": "UPDRS_off_NEAROFF"})
+                    ppmi_visits = ppmi_visits.merge(
+                        tmp[["PATNO","TEST_DATUM","UPDRS_off_NEAROFF"]],
+                        on=["PATNO","TEST_DATUM"], how="left"
+                    )
+                    # Safe coalesce & cleanup
+                    if "UPDRS_off_NEAROFF" in ppmi_visits.columns:
+                        if "UPDRS_off" not in ppmi_visits.columns:
+                            ppmi_visits["UPDRS_off"] = np.nan
                         ppmi_visits["UPDRS_off"] = ppmi_visits["UPDRS_off"].combine_first(ppmi_visits["UPDRS_off_NEAROFF"])
-                    ppmi_visits.drop(columns=[c for c in ppmi_visits.columns if c.endswith("_NEAROFF")], inplace=True, errors="ignore")
+                        ppmi_visits.drop(columns=["UPDRS_off_NEAROFF"], inplace=True, errors="ignore")
 
         return ppmi_visits
+
 
 
     def _prepare_non_dbs_data(
@@ -2866,6 +2840,202 @@ class Data:
             "eligible_custom_path": out_custom,
             "eligible_control_path": out_control,
         }
+    
+    def _build_visit_table(self, ppmi_cd: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+        """
+        Build a visit-level table with TEST_DATUM and as many harmonized features as we can:
+        - MoCA sums/categories (via _prepare_moca_with_demo)
+        - Demographics (SEX, AGE_AT_OP/AGE_AT_BASELINE, DIAG_DATE)
+        - LEDD near visit (via _ledd_nearest_per_visit called inside _prepare_moca_with_demo)
+        - UPDRS on/off attached by nearest exam ±365 days (preferring past) via _attach_updrs_on_and_off
+        Also computes TimeSinceBaselineDays/Years and TimeSinceDiag when DIAG_DATE exists.
+        """
+        # Start from MoCA+demo (already adds LEDD_pre and basic merges)
+        visits = self._prepare_moca_with_demo(ppmi_cd)
+        if visits.empty:
+            return visits
+
+        # Ensure a canonical visit date
+        visits = self._coalesce_visit_date(visits, out_col="TEST_DATUM",
+                                           prefer=("TEST_DATUM", "EXAMDT", "INFODT"))
+        visits = safe_parse_dates(visits, cols=["TEST_DATUM", "DIAG_DATE"], dayfirst=True, report=False)
+        visits = visits.dropna(subset=["PATNO", "TEST_DATUM"]).copy()
+        visits.sort_values(["PATNO", "TEST_DATUM"], inplace=True)
+
+        # TimeSinceBaseline
+        first_dt = visits.groupby("PATNO")["TEST_DATUM"].transform("min")
+        visits["TimeSinceBaselineDays"]  = (visits["TEST_DATUM"] - first_dt).dt.days
+        visits["TimeSinceBaselineYears"] = visits["TimeSinceBaselineDays"] / 365.25
+
+        # TimeSinceDiag (years) if DIAG_DATE exists
+        if "DIAG_DATE" in visits.columns:
+            visits["TimeSinceDiag"] = ((visits["TEST_DATUM"] - visits["DIAG_DATE"]).dt.days / 365.25)
+
+        # Attach UPDRS on/off without disturbing existing columns
+        visits = self._attach_updrs_on_and_off(
+            ppmi_visits=visits,
+            ppmi_cd=ppmi_cd,
+            nearest_window_days=365,
+            prefer_past=True
+        )
+        return visits
+
+
+    def longitudinal_after(
+        self,
+        base_df: pd.DataFrame,
+        *,
+        id_col: str = "PATNO",
+        anchor_date_col: str = "TEST_DATUM",
+        dayfirst: bool = True,
+        include_anchor_refs: bool = True,
+        complete_data: Dict[str, pd.DataFrame] | None = None,
+    ) -> pd.DataFrame:
+        """
+        Build follow-up rows for each anchor in base_df:
+          - Copy baseline (MoCA *_pre / *_sum_pre and AGE_AT_BASELINE aliases) from the anchor row.
+          - Fill MoCA *_post / *_sum_post from the follow-up visit row.
+          - Compute TimeSinceSurgery strictly as:
+                (follow-up TEST_DATUM - anchor[anchor_date_col]) / 365.25
+          - Keep base_df's column order; add __anchor_* refs if requested.
+        """
+        if id_col not in base_df.columns or anchor_date_col not in base_df.columns:
+            raise ValueError(f"`base_df` must contain '{id_col}' and '{anchor_date_col}' columns.")
+
+        # Normalize anchors
+        anchors = base_df[[id_col, anchor_date_col]].copy()
+        anchors = safe_parse_dates(anchors, cols=[anchor_date_col], dayfirst=dayfirst, report=False)
+        anchors = anchors.dropna(subset=[id_col, anchor_date_col]).copy()
+        if anchors.empty:
+            cols = list(base_df.columns)
+            if include_anchor_refs:
+                cols += ["__anchor_index", "__anchor_TEST_DATUM"]
+            return pd.DataFrame(columns=cols)
+
+        # Build visit table (includes MoCA subscores via your existing pipeline)
+        if complete_data is None:
+            raw = self.load_ppmi()
+            ppmi_cd = self.convert_to_standard_keys(raw, DBS=False)
+        else:
+            ppmi_cd = complete_data
+        visits = self._build_visit_table(ppmi_cd)
+        if visits.empty:
+            cols = list(base_df.columns)
+            if include_anchor_refs:
+                cols += ["__anchor_index", "__anchor_TEST_DATUM"]
+            return pd.DataFrame(columns=cols)
+
+        visits = visits.copy()
+        visits[id_col] = visits[id_col].astype(str)
+        anchors[id_col] = anchors[id_col].astype(str)
+
+        # Output schema = base schema (ensure id/date + TimeSinceSurgery present)
+        out_cols = list(base_df.columns)
+        if id_col not in out_cols: out_cols.append(id_col)
+        if "TEST_DATUM" not in out_cols: out_cols.append("TEST_DATUM")
+        tss_out = "TimeSinceSurgery" if "TimeSinceSurgery" in out_cols else ("TimeSinceSugery" if "TimeSinceSugery" in out_cols else "TimeSinceSurgery")
+        if tss_out not in out_cols: out_cols.append(tss_out)
+
+        # MoCA columns & age aliases
+        is_pre  = lambda c: c.startswith("MoCA_") and (c.endswith("_pre") or c.endswith("_sum_pre"))
+        is_post = lambda c: c.startswith("MoCA_") and (c.endswith("_post") or c.endswith("_sum_post"))
+        moca_pre_cols  = [c for c in base_df.columns if is_pre(c)]
+        moca_post_cols = [c for c in base_df.columns if is_post(c)]
+        age_aliases = [c for c in base_df.columns if c in ("AGE_AT_BASELINE", "Age_AT_BASELINE", "AGE_AT_BASLINE")]
+
+        def post_sources(post_col: str) -> list[str]:
+            if post_col == "MoCA_sum_post":
+                return ["MoCA_sum", "MoCA_ONLY_GES", "MoCA_sum_post"]
+            if post_col.endswith("_sum_post"):
+                stem = post_col[:-len("_sum_post")]
+                return [f"{stem}_sum", stem]
+            if post_col.endswith("_post"):
+                stem = post_col[:-len("_post")]
+                return [stem, f"{stem}_sum"]
+            return [post_col]
+        post_src_map = {c: post_sources(c) for c in moca_post_cols}
+
+        vgrp = {k: g for k, g in visits.groupby(id_col)}
+        rows = []
+
+        # Iterate anchors: (index, PATNO, ANCHOR_DATE)
+        for anchor_ix, pat, anchor_dt in anchors[[id_col, anchor_date_col]].itertuples(index=True, name=None):
+            g = vgrp.get(pat)
+            if g is None or g.empty: continue
+
+            # strictly after *this* anchor's date
+            foll = g[g["TEST_DATUM"] > anchor_dt]
+            if foll.empty: continue
+
+            anchor_row = base_df.loc[anchor_ix]
+            # hard-parse the anchor date from the anchor row's anchor_date_col
+            anchor_ref_dt = pd.to_datetime(anchor_row[anchor_date_col], errors="coerce")
+
+            for _, vrow in foll.iterrows():
+                new = {c: np.nan for c in out_cols}
+                new[id_col]      = vrow.get(id_col, pat)
+                new["TEST_DATUM"] = vrow.get("TEST_DATUM")
+
+                # Copy baseline from anchor
+                for c in moca_pre_cols:
+                    new[c] = anchor_row.get(c, np.nan)
+                for c in age_aliases:
+                    new[c] = anchor_row.get(c, np.nan)
+
+                # MoCA post from visit
+                for post_col, candidates in post_src_map.items():
+                    for src in candidates:
+                        if src in vrow.index and pd.notna(vrow[src]):
+                            new[post_col] = vrow[src]
+                            break
+
+                # Other overlapping visit columns (UPDRS_on/off, LEDD_pre, etc.)
+                for c in out_cols:
+                    if c in (id_col, "TEST_DATUM", tss_out): continue
+                    if c in moca_pre_cols or c in moca_post_cols or c in age_aliases: continue
+                    if c in vrow.index and pd.notna(vrow[c]):
+                        new[c] = vrow[c]
+
+                # ---- STRICT TimeSinceSurgery: row TEST_DATUM minus *this* anchor's date
+                fd = pd.to_datetime(new["TEST_DATUM"], errors="coerce")
+                if pd.notna(fd) and pd.notna(anchor_ref_dt):
+                    new[tss_out] = float((fd - anchor_ref_dt).days) / 365.25
+                else:
+                    new[tss_out] = np.nan
+
+                if include_anchor_refs:
+                    new["__anchor_index"] = anchor_ix
+                    new["__anchor_TEST_DATUM"] = anchor_ref_dt
+
+                rows.append(new)
+
+        if not rows:
+            cols = list(base_df.columns)
+            if tss_out not in cols: cols.append(tss_out)
+            if include_anchor_refs: cols += ["__anchor_index", "__anchor_TEST_DATUM"]
+            return pd.DataFrame(columns=cols)
+
+        out = pd.DataFrame(rows)
+
+        # Final columns in base order (+ tss + refs + id/date if needed)
+        final_cols = list(base_df.columns)
+        if tss_out not in final_cols: final_cols.append(tss_out)
+        if include_anchor_refs:
+            for extra in ("__anchor_index", "__anchor_TEST_DATUM"):
+                if extra not in final_cols: final_cols.append(extra)
+        for must in (id_col, "TEST_DATUM"):
+            if must not in final_cols and must in out.columns: final_cols.append(must)
+
+        # Parse date-like columns
+        date_cols = [c for c in final_cols if c.upper().endswith("DT") or "DATE" in c.upper() or c in ("TEST_DATUM", "__anchor_TEST_DATUM")]
+        out = safe_parse_dates(out, cols=date_cols, dayfirst=dayfirst, report=False)
+
+        return out[final_cols].reset_index(drop=True)
+
+
+
+
+
 
     # ---------- Optional: example main ----------
 if __name__ == "__main__":
@@ -2970,69 +3140,73 @@ if __name__ == "__main__":
     #medication_group["pairs"].to_csv("med_cohort_pairs.csv", index=False)
     #medication_group["balance"].to_csv("med_cohort_balance.csv")
 
-    dist_cohort = ppmi_data.select_medication_distribution_cohort(
-    csv_path=csv_path_updrs,
-    quest="moca",
-    id_column="PATNO",
-    soft_quota_tolerance=0.5,
-    use_updrs=True,
-    updrs_state="both",
-    unique_patient=True,          # one pair per PPMI subject
-    require_ledd=False,           # skip LEDD requirement if it’s too sparse
-    n_quantile_bins_per_dim=4,    # tune granularity (e.g., 4–8)
-    random_state=42,
-    )
-
-    dist_cohort["ppmi"].to_csv("ppmi_medication_distribution_cohort.csv", index=False)
-    ledd_dist_cohort = dist_cohort["ppmi"][dist_cohort["ppmi"]["LEDD_pre"].notna()]
-    ledd_dist_cohort.to_csv("ppmi_medication_distribution_cohort_ledd.csv", index=False)
-    updrs_dist_cohort = ledd_dist_cohort[ledd_dist_cohort["UPDRS_off"].notna()]
-    updrs_dist_cohort.to_csv("ppmi_medication_distribution_cohort_ledd_updrs.csv", index=False)
-    dist_cohort["bin_plan"].to_csv("ppmi_distribution_bin_plan.csv", index=False)
-    print(dist_cohort["balance"])
-    ppmi_dc = dist_cohort["ppmi"].copy()
-    ppmi_dc_ledd = ledd_dist_cohort.copy()
-    ppmi_dc_ledd_updrs = updrs_dist_cohort.copy()
-    # Pick the age column to plot (PPMI side uses AGE_AT_BASELINE in your function)
-    age_col = "AGE_AT_BASELINE" if "AGE_AT_BASELINE" in ppmi_dc.columns else (
-        "AGE_MATCH" if "AGE_MATCH" in ppmi_dc.columns else None
-    )
-
-    features = [
-        ("TimeSinceSurgery", "Time Since Surgery (years)"),
-        ("TimeSinceDiag",    "Time Since Diagnosis (years)"),
-    ]
-    if age_col:
-        features.append((age_col, "Age at Baseline (years)"))
-
-    def _clean_numeric(series):
-        s = pd.to_numeric(series, errors="coerce")
-        return s[np.isfinite(s)]
-
-
-    # Overlay: full cohort vs LEDD subset (if LEDD subset not empty)
-    if len(ppmi_dc_ledd) > 0:
-        for col, label in features:
-            if col not in ppmi_dc_ledd.columns:
-                continue
-            data_full = _clean_numeric(ppmi_dc[col])
-            data_ledd = _clean_numeric(ppmi_dc_ledd[col])
-            if len(data_full) == 0 or len(data_ledd) == 0:
-                continue
-
-            plt.figure(figsize=(7.5, 4.8))
-            # Set common bin edges for a fair overlay
-            lo = np.nanmin([data_full.min(), data_ledd.min()])
-            hi = np.nanmax([data_full.max(), data_ledd.max()])
-            bins = np.linspace(lo, hi, 30)
-
-            plt.hist(data_full, bins=bins, alpha=0.55, label="All PPMI", density=False)
-            plt.hist(data_ledd, bins=bins, alpha=0.55, label="LEDD subset", density=False)
-            plt.xlabel(label)
-            plt.ylabel("Count")
-            plt.title(f"Overlay: {label} — All vs LEDD subset")
-            plt.legend()
-            plt.grid(alpha=0.25)
-            plt.tight_layout()
-            plt.savefig(f"ppmi_distcohort_hist_overlay_{col}.png", dpi=200)
-            plt.close()
+    #dist_cohort = ppmi_data.select_medication_distribution_cohort(
+    #csv_path=csv_path_updrs,
+    #quest="moca",
+    #id_column="PATNO",
+    #soft_quota_tolerance=0.5,
+    #use_updrs=True,
+    #updrs_state="both",
+    #unique_patient=True,          # one pair per PPMI subject
+    #require_ledd=False,           # skip LEDD requirement if it’s too sparse
+    #n_quantile_bins_per_dim=4,    # tune granularity (e.g., 4–8)
+    #random_state=42,
+    #)
+#
+    #dist_cohort["ppmi"].to_csv("ppmi_medication_distribution_cohort.csv", index=False)
+    #ledd_dist_cohort = dist_cohort["ppmi"][dist_cohort["ppmi"]["LEDD_pre"].notna()]
+    #ledd_dist_cohort.to_csv("ppmi_medication_distribution_cohort_ledd.csv", index=False)
+    #updrs_dist_cohort = ledd_dist_cohort[ledd_dist_cohort["UPDRS_off"].notna()]
+    #updrs_dist_cohort.to_csv("ppmi_medication_distribution_cohort_ledd_updrs.csv", index=False)
+    #dist_cohort["bin_plan"].to_csv("ppmi_distribution_bin_plan.csv", index=False)
+    #print(dist_cohort["balance"])
+    #ppmi_dc = dist_cohort["ppmi"].copy()
+    #ppmi_dc_ledd = ledd_dist_cohort.copy()
+    #ppmi_dc_ledd_updrs = updrs_dist_cohort.copy()
+    ## Pick the age column to plot (PPMI side uses AGE_AT_BASELINE in your function)
+    #age_col = "AGE_AT_BASELINE" if "AGE_AT_BASELINE" in ppmi_dc.columns else (
+    #    "AGE_MATCH" if "AGE_MATCH" in ppmi_dc.columns else None
+    #)
+#
+    #features = [
+    #    ("TimeSinceSurgery", "Time Since Surgery (years)"),
+    #    ("TimeSinceDiag",    "Time Since Diagnosis (years)"),
+    #]
+    #if age_col:
+    #    features.append((age_col, "Age at Baseline (years)"))
+#
+    #def _clean_numeric(series):
+    #    s = pd.to_numeric(series, errors="coerce")
+    #    return s[np.isfinite(s)]
+#
+#
+    ## Overlay: full cohort vs LEDD subset (if LEDD subset not empty)
+    #if len(ppmi_dc_ledd) > 0:
+    #    for col, label in features:
+    #        if col not in ppmi_dc_ledd.columns:
+    #            continue
+    #        data_full = _clean_numeric(ppmi_dc[col])
+    #        data_ledd = _clean_numeric(ppmi_dc_ledd[col])
+    #        if len(data_full) == 0 or len(data_ledd) == 0:
+    #            continue
+#
+    #        plt.figure(figsize=(7.5, 4.8))
+    #        # Set common bin edges for a fair overlay
+    #        lo = np.nanmin([data_full.min(), data_ledd.min()])
+    #        hi = np.nanmax([data_full.max(), data_ledd.max()])
+    #        bins = np.linspace(lo, hi, 30)
+#
+    #        plt.hist(data_full, bins=bins, alpha=0.55, label="All PPMI", density=False)
+    #        plt.hist(data_ledd, bins=bins, alpha=0.55, label="LEDD subset", density=False)
+    #        plt.xlabel(label)
+    #        plt.ylabel("Count")
+    #        plt.title(f"Overlay: {label} — All vs LEDD subset")
+    #        plt.legend()
+    #        plt.grid(alpha=0.25)
+    #        plt.tight_layout()
+    #        plt.savefig(f"ppmi_distcohort_hist_overlay_{col}.png", dpi=200)
+    #        plt.close()
+#
+    base = pd.read_csv("eligible_matched_ppmi.csv")
+    followups = ppmi_data.longitudinal_after(base, id_col="PATNO", anchor_date_col="TEST_DATUM")
+    followups.to_csv("eligible_matched_ppmi_followups.csv", index=False)
